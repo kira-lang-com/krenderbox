@@ -1,3 +1,7 @@
 # 26.10.4
 
-Initial source release: A Kira port of RenderBox with display lists, shapes, fills, layers, clips, and styles rendered through Ember.
+The first source release of RenderBox includes:
+
+- A Kira display-list API with a state stack, layers, and drawing items.
+- Shapes, analytic primitives, paths, clips, colors, gradients, images, and shaders.
+- Rendering through Ember and types for blend modes, color spaces, and layer flags.
