@@ -1,0 +1,213 @@
+import Foundation
+
+// RB::Fill::Gradient::set_gradient_color: how Gradient::color finds a colour
+// and the stops it reads, as halves widened to floats.
+public enum GradientColorMode: UN8 {
+    TwoColors = 0
+    SmallSearch = 1
+    Search = 2
+    EvenlySpaced = 3
+}
+
+struct GradientColorGlobals {
+    var mode: GradientColorMode = .TwoColors
+    var smooth: Bool = false
+    // Each segment eased by its stop's exponent.
+    var curve: Bool = false
+    var first: RGBAColor = RGBAColor()
+    var last: RGBAColor = RGBAColor()
+    // The last stop's index, which an evenly spaced position is scaled by,
+    // or the two colours' curve exponent.
+    var scale: Number = 0
+    // The records a search runs over.
+    var count: Number = 0
+    var stops: [Number] = []
+    // Gradient::color_out's steps and the table it reads, as the mesh's.
+    var colorOut: Number = 0
+    var table: Number = 0
+}
+
+namespace GradientStopLimits {
+    // How far a location may be from evenly spaced and still count as it.
+    let spacingTolerance: Number = 0.001
+    // The most stops set_fill_state keeps in the small buffer, less one for
+    // a smooth gradient, by whether it is smooth.
+    let smallLinear: Number = 6
+    let smallSmooth: Number = 3
+}
+
+function colorGlobals(
+    gradient: borrow Gradient,
+    interpolated: borrow InterpolatedStops,
+    conversion: borrow InterpolationConversion
+) -> GradientColorGlobals {
+    let stops = interpolated.stops
+    var colors: [RGBAColor] = []
+    for stop in stops {
+        colors.append(conversion.prepared(stop.color))
+    }
+    let smooth = interpolated.interpolation == .Smooth
+    let curve = interpolated.interpolation == .Curve
+    let count = stops.count
+    var globals = GradientColorGlobals {
+        smooth: smooth,
+        curve: curve,
+        scale: count - 1,
+        count: count - 1
+    }
+    if twoColors(gradient, interpolated) {
+        globals.first = copy colors[0]
+        globals.last = copy colors[1]
+        if curve {
+            globals.scale = curveExponent(stops[0].midpoint)
+        }
+        return globals
+    }
+    storeStops(globals, gradient, interpolated, colors)
+    return globals
+}
+
+// The stop records, evenly spaced or searched, and the mode that reads them.
+function storeStops(
+    globals: borrow mut GradientColorGlobals,
+    gradient: borrow Gradient,
+    interpolated: borrow InterpolatedStops,
+    colors: borrow [RGBAColor]
+) {
+    let stops = interpolated.stops
+    let smooth = globals.smooth
+    let curve = globals.curve
+    let count = stops.count
+    let mirrored = gradient.edgeMode == .Mirror
+    if !interpolated.uneven {
+        globals.mode = .EvenlySpaced
+        globals.stops = smooth ? smoothEvenStops(colors, mirrored) : linearEvenStops(
+            stops,
+            colors,
+            curve
+        )
+        return
+    }
+    let small = smooth ? GradientStopLimits.smallSmooth : GradientStopLimits.smallLinear
+    globals.mode = count - (smooth ? 1 : 0) <= small ? .SmallSearch : .Search
+    globals.stops = smooth ? smoothSearchStops(stops, colors, mirrored) : linearSearchStops(
+        stops,
+        colors,
+        curve
+    )
+}
+
+// set_gradient_color's two-colour mode: two evenly spaced stops, not an
+// angular gradient's, and not a cubic's or a smooth gradient's.
+function twoColors(gradient: borrow Gradient, interpolated: borrow InterpolatedStops) -> Bool {
+    let interpolation = constructedInterpolation(gradient)
+    let eased = interpolation == .Cubic || interpolation == .Smooth
+    return gradient.stops.count == 2 && !interpolated.uneven && !angular(gradient) && !eased
+}
+
+function angular(gradient: borrow Gradient) -> Bool {
+    return match gradient.geometry {
+        Angular(arc) -> true
+        Axial(axial) -> false
+        Radial(radial) -> false
+        Conic(conic) -> false
+        Alpha -> false
+    }
+}
+
+// The Gradient constructor's test: every location within the tolerance of
+// its index over the last index.
+function evenlySpacedStops(stops: borrow [GradientStop]) -> Bool {
+    let step = 1 / (stops.count - 1)
+    for (index, stop) in stops.enumerated() {
+        if abs(stop.location - step * index) > GradientStopLimits.spacingTolerance {
+            return false
+        }
+    }
+    return true
+}
+
+function appendColor(words: borrow mut [Number], color: borrow RGBAColor) {
+    words.append(color.r)
+    words.append(color.g)
+    words.append(color.b)
+    words.append(color.a)
+}
+
+// Four floats a stop, five with a curve's exponent, and the last record
+// again so the last segment has an end.
+function linearEvenStops(
+    stops: borrow [GradientStop],
+    colors: borrow [RGBAColor],
+    curve: Bool
+) -> [Number] {
+    var words: [Number] = []
+    for (index, color) in colors.enumerated() {
+        appendColor(words, color)
+        if curve {
+            words.append(curveExponent(stops[index].midpoint))
+        }
+    }
+    let stride = curve ? 5 : 4
+    let last = words.count - stride
+    for offset in 0..stride {
+        words.append(words[last + offset])
+    }
+    return words
+}
+
+// Sixteen floats a segment, and the last stop's colour after them.
+function smoothEvenStops(colors: borrow [RGBAColor], mirrored: Bool) -> [Number] {
+    var words: [Number] = []
+    for index in 0..colors.count - 1 {
+        words.appendAll(smoothSegment(colors, index, mirrored))
+    }
+    appendColor(words, colors[colors.count - 1])
+    for _ in 0..12 {
+        words.append(0)
+    }
+    return words
+}
+
+// A search record per stop: one over the distance to the next location and
+// the record's location times it, then the stop's colour; the last
+// location's next is one.
+function linearSearchStops(
+    stops: borrow [GradientStop],
+    colors: borrow [RGBAColor],
+    curve: Bool
+) -> [Number] {
+    var words: [Number] = []
+    for (index, color) in colors.enumerated() {
+        let next = index + 1 < stops.count ? stops[index + 1].location : 1
+        let (scale, offset) = searchSpan(stops[index].location, next)
+        let exponent = curve ? curveExponent(stops[index].midpoint) : 0
+        words.appendAll([scale, offset, exponent, 0])
+        appendColor(words, color)
+    }
+    return words
+}
+
+// A record per segment: its span, then its cubic.
+function smoothSearchStops(
+    stops: borrow [GradientStop],
+    colors: borrow [RGBAColor],
+    mirrored: Bool
+) -> [Number] {
+    var words: [Number] = []
+    for index in 0..colors.count - 1 {
+        let (scale, offset) = searchSpan(stops[index].location, stops[index + 1].location)
+        words.append(scale)
+        words.append(offset)
+        words.appendAll(smoothSegment(colors, index, mirrored))
+    }
+    return words
+}
+
+// One over the span, the largest half when there is none, and minus the
+// start times it, in floats as RenderBox works them, each stored as a half.
+function searchSpan(location: Number, next: Number) -> (Number, Number) {
+    let span = floatRounded(next - location)
+    let scale = span == 0 ? HalfFloat.maximum : floatRounded(1 / span)
+    return (halfRounded(scale), halfRounded(floatRounded(-(location * scale))))
+}

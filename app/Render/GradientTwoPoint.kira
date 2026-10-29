@@ -1,0 +1,74 @@
+import Foundation
+
+// set_gradient_geometry for two circles with different centres. The circle
+// with a radius goes first, unless only the end has none; the point where the
+// radii run out is moved to the origin and the other centre to (1, 0), then
+// the axes are scaled so Gradient::value's hyperbola is the unit one.
+struct TwoCircles {
+    let first: Point
+    let firstRadius: Number
+    let second: Point
+    let secondRadius: Number
+    // Whether the circles were swapped, which reverses the position.
+    let swapped: Bool
+}
+
+function twoPointGeometry(
+    toUser: borrow AffineTransform,
+    radial: borrow RadialGradient
+) -> GradientGeometryGlobals {
+    let circles = orderedCircles(radial)
+    let difference = guardedDifference(circles.firstRadius - circles.secondRadius)
+    let start = circles.firstRadius / difference
+    let focal = Point {
+        x: circles.first.x + (circles.second.x - circles.first.x) * start,
+        y: circles.first.y + (circles.second.y - circles.first.y) * start
+    }
+    var globals = GradientGeometryGlobals {
+        toGradient: toUser.concatenating(translation(focal)),
+        first: start,
+        second: circles.secondRadius,
+        swapped: circles.swapped
+    }
+    if samePoint(focal, circles.second) {
+        return globals
+    }
+    let along = Point { x: circles.second.x - focal.x, y: circles.second.y - focal.y }
+    let distance = sqrt(along.x * along.x + along.y * along.y)
+    let radius = circles.secondRadius / distance
+    let (scaled, tangentRadius) = hyperbolaScale(radius, abs(1 - start))
+    globals.toGradient = globals.toGradient.concatenating(axisMap(along)).concatenating(scaled)
+    globals.second = tangentRadius
+    return globals
+}
+
+function orderedCircles(radial: borrow RadialGradient) -> TwoCircles {
+    if radial.endRadius != 0 {
+        return TwoCircles {
+            first: copy radial.startCenter,
+            firstRadius: abs(radial.startRadius),
+            second: copy radial.endCenter,
+            secondRadius: abs(radial.endRadius),
+            swapped: false
+        }
+    }
+    return TwoCircles {
+        first: copy radial.endCenter,
+        firstRadius: abs(radial.endRadius),
+        second: copy radial.startCenter,
+        secondRadius: abs(radial.startRadius),
+        swapped: true
+    }
+}
+
+// The axes' scale for the second circle's radius over the centres' distance,
+// and the radius Gradient::value is given: one when the circles are tangent.
+function hyperbolaScale(radius: Number, span: Number) -> (AffineTransform, Number) {
+    let squared = radius * radius - 1
+    if abs(squared) < GradientGeometryConstants.tangentLimit {
+        return (AffineTransform { a: span / 2, d: span / 2 }, 1)
+    }
+    let along = radius * span / squared
+    let across = sqrt(abs(squared)) * span / squared
+    return (AffineTransform { a: along, d: across }, radius)
+}

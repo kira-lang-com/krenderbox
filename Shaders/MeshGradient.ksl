@@ -1,0 +1,390 @@
+// RenderBox's mesh_gradient_vertex and accumulator_mesh_gradient_fragment,
+// drawing a mesh gradient's colour at every pixel of a surface the coverage
+// then samples.
+//
+// A patch is cut into a grid of `side` by `side` cells, two triangles each,
+// whose corners lie on the patch's bicubic tensor. Each pixel keeps the
+// fragment nearest the end of the patch order: the depth is the patch's
+// index and, below it, the cell's v then u. The colour runs bilinearly
+// between the corners or along cubics, then Gradient::color_out takes it
+// from the space it ran in to the pass's and it is dithered with
+// RenderBox's noise, as a gradient's. Triangles carry their own colours.
+// Where nothing drew, the background fills.
+
+type MeshGlobals {
+    // Mesh space to device pixels: x * matrix.xy + y * matrix.zw + translation.
+    let matrix: Float4
+    let translation: Float2
+    // Device pixels to clip space: x * scale.x - 1, 1 - y * scale.y.
+    let scale: Float2
+    // The cell drawn first, counting every patch's cells in order.
+    let last: Float
+    // Cells to a patch, and to a side of one, and one over the side.
+    let cells: Float
+    let side: Float
+    let step: Float
+    // What the patch index adds to the depth.
+    let depthBase: Float
+    // 0 bilinear patches, 1 cubic patches, 2 triangles, 3 the background.
+    let mode: Float
+    // Gradient::color_out's steps, the fill state's bits 0 to 2: the table,
+    // colours all opaque, OKLab. Then the table's index.
+    let colorOut: Float
+    let table: Float
+    let background: Float4
+}
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+    let uv: Float2
+    let patch: Float
+    let color: Float4
+}
+
+type FragmentOut {
+    let color: Half4
+}
+
+// Sixteen points then sixteen colours.
+const patchFloats: UInt = 96
+const colorsAt: UInt = 32
+// A triangle's vertex: its point and its colour.
+const vertexFloats: UInt = 6
+// What `mesh_gradient_vertex` scales its depth by, 2^-32.
+const depthScale: Float = 2.32830644e-10
+
+function unpremultiplied(color: Float4) -> Float4 {
+    if color.w > 0.0010004 {
+        return half4(Float4(color.xyz / color.w, color.w))
+    }
+    return Float4(0.0, 0.0, 0.0, 0.0)
+}
+
+// 2^n for a whole n, exactly: products of exact powers, where the GPU's
+// exp2 may miss by an ulp.
+function power2(n: Float) -> Float {
+    let k = abs(n)
+    let square = 2.0
+    if n < 0.0 {
+        square = 0.5
+    }
+    let result = 1.0
+    let step = 1.0
+    while step < 64.0 {
+        if fract(floor(k / step) * 0.5) != 0.0 {
+            result = result * square
+        }
+        square = square * square
+        step = step * 2.0
+    }
+    return result
+}
+
+// The entry of a table for |value|: its bits as a half over eight.
+function halfEntry(value: Float) -> Float {
+    let magnitude = abs(value)
+    if magnitude >= 65520.0 {
+        return 3968.0
+    }
+    if magnitude < 0.00006103515625 {
+        return floor(round(magnitude * 16777216.0) / 8.0)
+    }
+    let exponent = floor(log2(magnitude))
+    if power2(exponent) > magnitude {
+        exponent = exponent - 1.0
+    }
+    if power2(exponent + 1.0) <= magnitude {
+        exponent = exponent + 1.0
+    }
+    let mantissa = round((magnitude / power2(exponent) - 1.0) * 1024.0)
+    return floor(((exponent + 15.0) * 1024.0 + mantissa) / 8.0)
+}
+
+const halfSmallest: Float = 0.00006103515625
+const halfTiny: Float = 0.000000059604644775390625
+
+// A half's bits for the half nearest `value`, which is not negative.
+function halfBits(value: Float) -> Float {
+    if value < halfSmallest {
+        return round(value / halfTiny)
+    }
+    let exponent = floor(log2(value))
+    if power2(exponent) > value {
+        exponent = exponent - 1.0
+    }
+    if power2(exponent + 1.0) <= value {
+        exponent = exponent + 1.0
+    }
+    let mantissa = round((value / power2(exponent) - 1.0) * 1024.0)
+    return (exponent + 15.0) * 1024.0 + mantissa
+}
+
+function halfValue(bits: Float) -> Float {
+    let exponent = floor(bits / 1024.0)
+    let mantissa = bits - exponent * 1024.0
+    if exponent == 0.0 {
+        return mantissa * halfTiny
+    }
+    return (1.0 + mantissa / 1024.0) * power2(exponent - 15.0)
+}
+
+// The half nearest `value`: RenderBox runs the mesh's colour in halves, each
+// step rounded.
+function half(value: Float) -> Float {
+    return sign(value) * halfValue(halfBits(abs(value)))
+}
+
+function half4(value: Float4) -> Float4 {
+    return Float4(half(value.x), half(value.y), half(value.z), half(value.w))
+}
+
+// a * b + c rounded once to a half, as RenderBox's fused steps.
+function halfFma(a: Float, b: Float4, c: Float4) -> Float4 {
+    return half4(b * a + c)
+}
+
+// OKLab's cube-rooted LMS back to linear: each cubed, then the halves of
+// the inverse matrix RenderBox keeps, m's column first, every step in halves.
+function fromOklab(color: Float4) -> Float4 {
+    let lms = Float4(
+        half(color.x * half(color.x * color.x)),
+        half(color.y * half(color.y * color.y)),
+        half(color.z * half(color.z * color.z)),
+        0.0,
+    )
+    let m = half4(Float4(-3.30859375, 2.609375, -0.70361328125, 0.0) * lms.y)
+    let l = halfFma(lms.x, Float4(4.078125, -1.2685546875, -0.0041961669921875, 0.0), m)
+    let rgb = halfFma(lms.z, Float4(0.23095703125, -0.34130859375, 1.7080078125, 0.0), l)
+    return Float4(rgb.xyz, color.w)
+}
+
+// The Bezier in `f` through four values.
+function bezier(p0: Float2, p1: Float2, p2: Float2, p3: Float2, f: Float) -> Float2 {
+    let g = 1.0 - f
+    return p0 * (g * g * g) + (p1 * g + p2 * f) * (3.0 * f * g) + p3 * (f * f * f)
+}
+
+shader MeshGradient {
+    group Fill {
+        uniform globals: MeshGlobals
+        storage read mesh: [Float]
+        texture noise: Texture2d
+        sampler noiseSampler: Sampler
+        storage read transfer: [Float]
+    }
+
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        function pointAt(at: UInt) -> Float2 {
+            return Float2(mesh[at], mesh[at + UInt(1)])
+        }
+
+        // Row `row` of the patch at `base`, a Bezier in v.
+        function rowAt(base: UInt, row: UInt, v: Float) -> Float2 {
+            let at = base + row * UInt(8)
+            return bezier(
+                pointAt(at),
+                pointAt(at + UInt(2)),
+                pointAt(at + UInt(4)),
+                pointAt(at + UInt(6)),
+                v,
+            )
+        }
+
+        function toClip(point: Float2, depth: Float) -> Float4 {
+            let device = globals.matrix.xy * point.x + globals.matrix.zw * point.y + globals.translation
+            return Float4(device.x * globals.scale.x - 1.0, 1.0 - device.y * globals.scale.y, depth, 1.0)
+        }
+
+        // Cells are drawn from the last, each as the quad strip 1 0 2 3:
+        // triangles 1 0 2 and 0 2 3 over the cell's corners 0 (u0, v0),
+        // 1 (u1, v0), 2 (u1, v1) and 3 (u0, v1).
+        function patchVertex(vid: UInt) -> VertexOut {
+            let id = UInt(globals.last) - vid / UInt(6)
+            let index = vid % UInt(6)
+            let corner = UInt(0)
+            if index == UInt(0) {
+                corner = UInt(1)
+            }
+            if index == UInt(2) || index == UInt(4) {
+                corner = UInt(2)
+            }
+            if index == UInt(5) {
+                corner = UInt(3)
+            }
+            let cells = UInt(globals.cells)
+            let side = UInt(globals.side)
+            let patch = id / cells
+            let cell = id % cells
+            let x = Float(cell % side)
+            let y = Float(cell / side)
+            if corner == UInt(1) || corner == UInt(2) {
+                x = x + 1.0
+            }
+            if corner > UInt(1) {
+                y = y + 1.0
+            }
+            let u = x * globals.step
+            let v = y * globals.step
+            let base = patch * patchFloats
+            let point = bezier(rowAt(base, UInt(0), v), rowAt(base, UInt(1), v), rowAt(base, UInt(2), v), rowAt(base, UInt(3), v), u)
+            let key = floor(v * 255.0 + 0.5) * 0.00390625 + floor(u * 255.0 + 0.5) * 0.0000152587890625
+            let out: VertexOut
+            out.clip_position = toClip(point, (key + Float(patch) + globals.depthBase) * depthScale)
+            out.uv = Float2(u, v)
+            out.patch = Float(patch) + 0.5
+            out.color = Float4(0.0, 0.0, 0.0, 0.0)
+            return out
+        }
+
+        function triangleVertex(vid: UInt) -> VertexOut {
+            let at = vid * vertexFloats
+            let out: VertexOut
+            out.clip_position = toClip(pointAt(at), globals.depthBase * depthScale)
+            out.uv = Float2(0.0, 0.0)
+            out.patch = 0.0
+            out.color = Float4(mesh[at + UInt(2)], mesh[at + UInt(3)], mesh[at + UInt(4)], mesh[at + UInt(5)])
+            return out
+        }
+
+        // The whole target, at the depth nothing drew to.
+        function backgroundVertex(vid: UInt) -> VertexOut {
+            let corner = vid
+            if vid == UInt(3) {
+                corner = UInt(0)
+            }
+            if vid > UInt(3) {
+                corner = vid - UInt(2)
+            }
+            let x = -1.0
+            if corner == UInt(1) || corner == UInt(2) {
+                x = 1.0
+            }
+            let y = 1.0
+            if corner > UInt(1) {
+                y = -1.0
+            }
+            let out: VertexOut
+            out.clip_position = Float4(x, y, 0.0, 1.0)
+            out.uv = Float2(0.0, 0.0)
+            out.patch = 0.0
+            out.color = globals.background
+            return out
+        }
+
+        function entry(input: VertexIn) -> VertexOut {
+            if globals.mode == 2.0 {
+                return triangleVertex(input.vid)
+            }
+            if globals.mode == 3.0 {
+                return backgroundVertex(input.vid)
+            }
+            return patchVertex(input.vid)
+        }
+    }
+
+    fragment {
+        input VertexOut
+        output FragmentOut
+
+        function colorAt(at: UInt) -> Float4 {
+            return Float4(mesh[at], mesh[at + UInt(1)], mesh[at + UInt(2)], mesh[at + UInt(3)])
+        }
+
+        // Column `column` of the colour tensor, a cubic in v in power form,
+        // by Horner's rule.
+        function columnAt(base: UInt, column: UInt, v: Float) -> Float4 {
+            let at = base + colorsAt + column * UInt(16)
+            let c0 = colorAt(at)
+            let c1 = colorAt(at + UInt(4))
+            let c2 = colorAt(at + UInt(8))
+            let c3 = colorAt(at + UInt(12))
+            return halfFma(v, halfFma(v, halfFma(v, c3, c2), c1), c0)
+        }
+
+        // `a` to `b` at `t`, as RenderBox's fma pair: t (-a) + a, then t b
+        // added.
+        function halfMix(a: Float4, b: Float4, t: Float) -> Float4 {
+            return halfFma(t, b, halfFma(t, -a, a))
+        }
+
+        // sample_mesh_gradient: the colour at (u, v), every step in halves.
+        function patchColor(input: VertexOut) -> Float4 {
+            let base = UInt(input.patch) * patchFloats
+            let u = half(input.uv.x)
+            let v = half(input.uv.y)
+            if globals.mode == 1.0 {
+                let g = half(1.0 - u)
+                let g3 = half(g * half(g * g))
+                let across = half(half(u * 3.0) * g)
+                let towards = half4(columnAt(base, UInt(2), v) * u)
+                let middle = half4(halfFma(g, columnAt(base, UInt(1), v), towards) * across)
+                let early = halfFma(g3, columnAt(base, UInt(0), v), middle)
+                return halfFma(half(u * half(u * u)), columnAt(base, UInt(3), v), early)
+            }
+            let at = base + colorsAt
+            let near = halfMix(colorAt(at), colorAt(at + UInt(4)), v)
+            let far = halfMix(colorAt(at + UInt(8)), colorAt(at + UInt(12)), v)
+            return halfMix(near, far, u)
+        }
+
+        function transferred(color: Float4) -> Float4 {
+            let base = globals.table * 4096.0
+            let r = sign(color.x) * transfer[UInt(base + halfEntry(color.x))]
+            let g = sign(color.y) * transfer[UInt(base + halfEntry(color.y))]
+            let b = sign(color.z) * transfer[UInt(base + halfEntry(color.z))]
+            return Float4(r, g, b, color.w)
+        }
+
+        // Gradient::color_out: unpremultiplied unless every colour is
+        // opaque, out of OKLab, through the table, premultiplied again.
+        function colorOut(color: Float4) -> Float4 {
+            let bits = UInt(globals.colorOut)
+            if (bits & UInt(5)) == UInt(0) {
+                return color
+            }
+            let opaque = (bits & UInt(2)) != UInt(0)
+            let result = color
+            if !opaque {
+                result = unpremultiplied(result)
+            }
+            if (bits & UInt(4)) != UInt(0) {
+                result = fromOklab(result)
+            }
+            if (bits & UInt(1)) != UInt(0) {
+                result = transferred(result)
+            }
+            if !opaque {
+                result = half4(Float4(result.xyz * result.w, result.w))
+            }
+            return result
+        }
+
+        function entry(input: VertexOut) -> FragmentOut {
+            let result: FragmentOut
+            if globals.mode == 3.0 {
+                result.color = Half4(input.color)
+                return result
+            }
+            let color = input.color
+            if globals.mode < 2.0 {
+                color = patchColor(input)
+            }
+            color = colorOut(color)
+            let device = input.clip_position.xy
+            let noiseAt = sample(noise, noiseSampler, device * 0.03125)
+            let dither = half4(Float4(noiseAt.xyz * 0.0078430176 - 0.0039215088, 0.0))
+            let dithered = half4(Float4(dither.xyz * color.w + color.xyz, color.w))
+            result.color = Half4(dithered)
+            return result
+        }
+    }
+}

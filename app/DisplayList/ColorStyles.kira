@@ -1,0 +1,104 @@
+import Foundation
+
+// The colour styles RenderBox builds as a colour matrix: each a 4 by 5
+// matrix, row by row, as ColorMatrixStyle holds it.
+
+// The Rec. 709 luminance weights RenderBox's colour matrices use.
+namespace LuminanceWeights {
+    let red: Number = 0.2126
+    let green: Number = 0.7152
+    let blue: Number = 0.0722
+}
+
+// ColorMatrix::set_alpha_multiply: the colour itself at its alpha times the
+// pixel's, or, `inverse`, times one less the pixel's. `premultiplied`
+// scales the colour by its alpha and reads it through the pixel's alpha
+// instead of adding it.
+function alphaMultiplyMatrix(
+    color: borrow RGBAColor,
+    premultiplied: Bool,
+    inverse: Bool
+) -> [Number] {
+    let alphaRow: [Number] = inverse ? [0, 0, 0, -color.a, color.a] : [0, 0, 0, color.a, 0]
+    if premultiplied && !inverse {
+        let a = color.a
+        var matrix: [Number] = [0, 0, 0, color.r * a, 0, 0, 0, 0, color.g * a, 0, 0, 0, 0]
+        matrix.appendAll([color.b * a, 0])
+        matrix.appendAll(alphaRow)
+        return matrix
+    }
+    var matrix: [Number] = [0, 0, 0, 0, color.r, 0, 0, 0, 0, color.g, 0, 0, 0, 0, color.b]
+    matrix.appendAll(alphaRow)
+    return matrix
+}
+
+// ColorMatrix::set_color_monochrome: `amount` of the way from the pixel to
+// its luminance, plus `bias`, tinted by `color`; its alpha scaled toward
+// the colour's.
+function monochromeMatrix(amount: Number, color: borrow RGBAColor, bias: Number) -> [Number] {
+    let keep = 1 - amount
+    let tint = [amount * color.r, amount * color.g, amount * color.b]
+    let weights = [LuminanceWeights.red, LuminanceWeights.green, LuminanceWeights.blue]
+    var matrix: [Number] = []
+    for row in 0..3 {
+        for column in 0..3 {
+            let own = row == column ? keep : 0
+            matrix.append(own + tint[row] * weights[column])
+        }
+        matrix.append(0)
+        matrix.append(tint[row] * bias)
+    }
+    matrix.appendAll([0, 0, 0, keep + color.a * amount, 0])
+    return matrix
+}
+
+// ColorMatrix::set_saturate: each channel `amount` of the way from the
+// pixel's luminance to itself; a negative amount is none. RenderBox's own
+// red weight keeps 0.7873 of the red, not 0.7874.
+function saturationMatrix(amount: Number) -> [Number] {
+    let s = max(amount, 0)
+    let weights = [LuminanceWeights.red, LuminanceWeights.green, LuminanceWeights.blue]
+    let own = [s * 0.7873 + LuminanceWeights.red, s * 0.2848 + LuminanceWeights.green, s * 0.9278 + LuminanceWeights.blue]
+    var matrix: [Number] = []
+    for row in 0..3 {
+        for column in 0..3 {
+            matrix.append(row == column ? own[column] : weights[column] - s * weights[column])
+        }
+        matrix.appendAll([0, 0])
+    }
+    matrix.appendAll([0, 0, 0, 1, 0])
+    return matrix
+}
+
+extend DisplayList {
+    // -[RBDisplayList addAlphaMultiplyFilterWithColor:colorSpace:flags:].
+    function addAlphaMultiplyFilter(color: RGBAColor, flags: ColorFilterFlags) {
+        let premultiplied = flags.has(ColorFilterFlags.premultiplied)
+        addColorMatrixFilter(alphaMultiplyMatrix(color, premultiplied, false), flags)
+    }
+
+    // -[RBDisplayList addColorMonochromeFilterWithAmount:color:colorSpace:bias:flags:].
+    // A premultiplied filter takes the colour premultiplied.
+    function addColorMonochromeFilter(
+        amount: Number,
+        color: RGBAColor,
+        bias: Number,
+        flags: ColorFilterFlags
+    ) {
+        var tint = copy color
+        if flags.has(ColorFilterFlags.premultiplied) {
+            tint = RGBAColor {
+                r: color.r * color.a,
+                g: color.g * color.a,
+                b: color.b * color.a,
+                a: color.a
+            }
+        }
+        addColorMatrixFilter(monochromeMatrix(amount, tint, bias), flags)
+    }
+
+    // -[RBDisplayList addSaturationFilterWithAmount:flags:].
+    function addSaturationFilter(amount: Number, flags: ColorFilterFlags) {
+        addColorMatrixFilter(saturationMatrix(amount), flags)
+    }
+}

@@ -1,0 +1,359 @@
+import Foundation
+import Ember
+
+// RB::Path::ImmediateRenderer for a fill without a stencil
+// (RB::Path::Renderer::resolve): its edges summed into an accumulator, then
+// a plane over the path's bounds turns the sum into coverage
+// (accumulator_shape) and paints through it (RB::Path::Paint::fill). An
+// antialiased fill sums path_exterior's coverage, an aliased one
+// path_interior's whole windings; a distance mode with a distance keeps
+// path_distance's nearness to the outline first and adds path_interior's
+// windings to it. A distance mode without one draws antialiased.
+namespace PathDrawing {
+    // `group Path` in the path shaders and `group Paint` in
+    // `Shaders/Accumulator.ksl`, their bindings in order.
+    let group: UN32 = 0
+    let pathGlobalsBinding: UN32 = 0
+    let segmentsBinding: UN32 = 1
+    let paintGlobalsBinding: UN32 = 0
+    let accumulatorBinding: UN32 = 1
+    let accumulatorSamplerBinding: UN32 = 2
+    let fillBinding: UN32 = 3
+    let fillSamplerBinding: UN32 = 4
+    let maskBinding: UN32 = 5
+    let maskSamplerBinding: UN32 = 6
+    let pathGlobalsFloatCount: UN32 = 16
+    let paintGlobalsFloatCount: UN32 = 40
+    // Two triangles per edge for path_exterior's and path_distance's quads,
+    // one for path_interior's, and two over the plane.
+    let quadVertices: Number = 6
+    let triangleVertices: Number = 3
+    let planeVertices: UN32 = 6
+    // How far past the path's bounds an edge's antialiasing reaches.
+    let planeMargin: Number = 1
+    let exteriorPipeline: String = "renderbox-path-exterior"
+    let interiorPipeline: String = "renderbox-path-interior"
+    let distancePipeline: String = "renderbox-path-distance"
+    let accumulatorPipeline: String = "renderbox-accumulator"
+}
+
+// What resolve draws for a rendering mode, the distance a distance mode
+// measures in device pixels.
+enum PathPasses {
+    Exterior
+    Interior
+    Distance(Number)
+}
+
+function pathPasses(mode: RenderingMode, argument: Number) -> PathPasses {
+    return match mode {
+        Antialiased -> .Exterior
+        Aliased -> .Interior
+        InnerDistance, OuterDistance, SignedDistance -> argument > 0 ? .Distance(
+            argument
+        ) : .Exterior
+    }
+}
+
+// `filled`'s coverage under `paint` through `mask`, as a draw for the pass
+// the item is in. The accumulator pass runs now, before that pass.
+function pathDraw(
+    session: borrow mut RenderSession,
+    filled: borrow FilledPath,
+    item: borrow ShapeItem,
+    paint: Paint,
+    mask: GraphicsTexture?
+) -> Result<RecordedDraw?, RenderFailure> {
+    let mode = item.shape.renderingMode
+    let passes = pathPasses(mode, item.shape.renderingModeArgument)
+    let toDevice = filled.transform.concatenating(item.state.transform)
+    let buffer = segmentBuffer(flattened(filled.path, toDevice, mode))
+    if buffer.edges == 0 {
+        return .Ok(.None)
+    }
+    let accumulator = match accumulated(session, buffer, passes) {
+        Ok(accumulator) -> accumulator
+        Error(failure) -> return .Error(failure)
+    }
+    let globals = AccumulatorGlobals {
+        plane: planeRect(paintedBounds(buffer.bounds, mode, passes)),
+        evenOdd: item.shape.fillRule == .EvenOdd,
+        distance: distanceShaped(mode, passes)
+    }
+    return accumulatorDraw(
+        session,
+        move globals,
+        move accumulator,
+        move paint,
+        move mask,
+        item.blendMode
+    )
+}
+
+// The rendering mode whose shape the accumulator makes, when it holds
+// path_distance's nearness.
+function distanceShaped(mode: RenderingMode, passes: borrow PathPasses) -> RenderingMode? {
+    return match passes {
+        Distance(reach) -> .Some(mode)
+        Exterior, Interior -> .None
+    }
+}
+
+// The path's bounds, out by the distance where an outer or signed shape
+// covers past its outline.
+function paintedBounds(
+    bounds: borrow Rect,
+    mode: RenderingMode,
+    passes: borrow PathPasses
+) -> Rect {
+    let reach = match passes {
+        Distance(reach) -> reach
+        Exterior, Interior -> return copy bounds
+    }
+    if mode == .InnerDistance {
+        return copy bounds
+    }
+    return Rect {
+        x: bounds.x - reach,
+        y: bounds.y - reach,
+        width: bounds.width + reach * 2,
+        height: bounds.height + reach * 2
+    }
+}
+
+// The pixels the path's edges can reach: its bounds out to whole pixels and
+// the antialiasing's margin.
+function planeRect(bounds: borrow Rect) -> Rect {
+    let left = floor(bounds.minX()) - PathDrawing.planeMargin
+    let top = floor(bounds.minY()) - PathDrawing.planeMargin
+    let right = ceil(bounds.maxX()) + PathDrawing.planeMargin
+    let bottom = ceil(bounds.maxY()) + PathDrawing.planeMargin
+    return Rect { x: left, y: top, width: right - left, height: bottom - top }
+}
+
+// One of resolve's draws over every edge.
+enum PathPass {
+    Exterior
+    Interior
+    Distance
+}
+
+// An accumulator the size of the target with every edge of `buffer` drawn
+// into it by `passes`.
+function accumulated(
+    session: borrow mut RenderSession,
+    buffer: borrow SegmentBuffer,
+    passes: borrow PathPasses
+) -> Result<GraphicsTexture, RenderFailure> {
+    let accumulator = match floatSurface(session, "renderbox-path-accumulator") {
+        Ok(accumulator) -> accumulator
+        Error(failure) -> return .Error(failure)
+    }
+    let (reach, order): (Number, [PathPass]) = match passes {
+        Exterior -> (0, [.Exterior])
+        Interior -> (0, [.Interior])
+        Distance(reach) -> (reach, [.Distance, .Interior])
+    }
+    let buffers = match pathBuffers(session, buffer, reach) {
+        Ok(buffers) -> buffers
+        Error(failure) -> return .Error(failure)
+    }
+    var draws: [RecordedDraw] = []
+    for pass in order {
+        let draw = try pathPassDraw(session, buffers, pass, buffer.edges)
+        draws.append(draw)
+    }
+    return match drawPass(session, accumulator, Surfaces.transparent, draws) {
+        Ok -> .Ok(accumulator)
+        Error(failure) -> .Error(failure)
+    }
+}
+
+// A target-sized half-float surface: RB::Path::Accumulator's target, whose
+// winding is a signed sum, and a gradient's colours before coverage.
+function floatSurface(
+    session: borrow mut RenderSession,
+    label: String
+) -> Result<GraphicsTexture, RenderFailure> {
+    return pooledSurface(
+        session,
+        TextureDescriptor {
+            label: label,
+            width: session.width,
+            height: session.height,
+            format: .Rgba16Float,
+            usage: .RenderTargetSampled
+        }
+    )
+}
+
+// PathGlobals for a buffer already in device space, and the buffer itself.
+struct PathBuffers {
+    let globals: GraphicsUniform
+    let segments: GraphicsBuffer
+}
+
+function pathBuffers(
+    session: borrow mut RenderSession,
+    buffer: borrow SegmentBuffer,
+    reach: Number
+) -> Result<PathBuffers, RenderFailure> {
+    let segments = match session.device.graphics().createStorageBufferWords(
+        "renderbox-path-segments",
+        buffer.words
+    ) {
+        Ok(segments) -> segments
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.buffers.append(copy segments)
+    let bounds = buffer.bounds
+    let globals = [
+        1, 0, 0, 1,
+        0, 0,
+        2 / Number(session.width), 2 / Number(session.height),
+        bounds.x + bounds.width * 0.5, bounds.y + bounds.height * 0.5,
+        0, bounds.maxX(), buffer.lines ? 1 : 0, reach,
+        0, 0
+    ]
+    let made = sessionUniform(
+        session,
+        "renderbox-path-globals",
+        PathDrawing.pathGlobalsFloatCount,
+        move globals
+    )
+    return match made {
+        Ok(uniform) -> .Ok(PathBuffers { globals: uniform, segments: move segments })
+        Error(failure) -> .Error(failure)
+    }
+}
+
+// `pass`'s draw over `edges` edges.
+function pathPassDraw(
+    session: borrow mut RenderSession,
+    buffers: borrow PathBuffers,
+    pass: PathPass,
+    edges: Number
+) -> Result<RecordedDraw, RenderFailure> {
+    let (name, vertices) = match pass {
+        Exterior -> (PathDrawing.exteriorPipeline, PathDrawing.quadVertices)
+        Interior -> (PathDrawing.interiorPipeline, PathDrawing.triangleVertices)
+        Distance -> (PathDrawing.distancePipeline, PathDrawing.quadVertices)
+    }
+    let pipeline = try passPipeline(session, pass)
+    let graphics = session.device.graphics()
+    let bindGroup = match graphics.beginBindGroup(name) {
+        Ok(bindGroup) -> bindGroup
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    graphics.bindGroupAddUniform(bindGroup, PathDrawing.pathGlobalsBinding, buffers.globals)
+    graphics.bindGroupAddStorageBuffer(bindGroup, PathDrawing.segmentsBinding, buffers.segments)
+    session.bindGroups.append(copy bindGroup)
+    return .Ok(
+        RecordedDraw {
+            pipeline: pipeline,
+            bindGroup: bindGroup,
+            vertexCount: UN32(edges * vertices)
+        }
+    )
+}
+
+// A uniform of `floats`, released with the session.
+function sessionUniform(
+    session: borrow mut RenderSession,
+    label: String,
+    count: UN32,
+    floats: [Number]
+) -> Result<GraphicsUniform, RenderFailure> {
+    let made = session.device.graphics().createUniform(
+        UniformDescriptor { label: label, expectedFloatCount: count, data: floats }
+    )
+    let uniform = match made {
+        Ok(uniform) -> uniform
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.uniforms.append(copy uniform)
+    return .Ok(uniform)
+}
+
+// `pass`'s pipeline: path_exterior's coverage and path_interior's windings
+// are added to the accumulator (RB::BlendMode 11), path_distance's nearness
+// kept where it is the largest (15).
+function passPipeline(
+    session: borrow mut RenderSession,
+    pass: PathPass
+) -> Result<RenderPipeline, RenderFailure> {
+    let added = ColorTargetDescriptor {
+        format: .Rgba16Float,
+        blend: BlendState { enabled: true, custom: .Some(blendOf(.One, .One)) }
+    }
+    return match pass {
+        Exterior -> namedPipeline(
+            session,
+            PathDrawing.exteriorPipeline,
+            ksl!("Shaders/PathExterior.ksl"),
+            move added
+        )
+        Interior -> namedPipeline(
+            session,
+            PathDrawing.interiorPipeline,
+            ksl!("Shaders/PathInterior.ksl"),
+            move added
+        )
+        Distance -> namedPipeline(
+            session,
+            PathDrawing.distancePipeline,
+            ksl!("Shaders/PathDistance.ksl"),
+            ColorTargetDescriptor {
+                format: .Rgba16Float,
+                blend: BlendState { enabled: true, custom: .Some(blendOperation(.Max)) }
+            }
+        )
+    }
+}
+
+// The pipeline named `name` drawing `artifact` into `target`, made the first
+// time a draw asks for it.
+function namedPipeline(
+    session: borrow mut RenderSession,
+    name: String,
+    artifact: borrow KslArtifact,
+    target: ColorTargetDescriptor
+) -> Result<RenderPipeline, RenderFailure> {
+    let depth = DepthStencilDescriptor { depthCompare: .Always }
+    return namedDepthPipeline(session, move name, artifact, move target, move depth)
+}
+
+// `namedPipeline` testing and writing a depth attachment as `depth` says.
+function namedDepthPipeline(
+    session: borrow mut RenderSession,
+    name: String,
+    artifact: borrow KslArtifact,
+    target: ColorTargetDescriptor,
+    depth: DepthStencilDescriptor
+) -> Result<RenderPipeline, RenderFailure> {
+    for (served, pipeline) in session.functionPipelines {
+        if served == name {
+            return .Ok(copy pipeline)
+        }
+    }
+    let graphics = session.device.graphics()
+    let compiled = match graphics.createShaderFromKslArtifact(name, artifact) {
+        Ok(compiled) -> compiled
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.shaders.append(copy compiled)
+    let made = graphics.createRenderPipeline(
+        RenderPipelineDescriptor {
+            label: copy name,
+            shader: compiled,
+            colorTargets: [target],
+            depthStencil: depth
+        }
+    )
+    let pipeline = match made {
+        Ok(pipeline) -> pipeline
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.functionPipelines.append((name, copy pipeline))
+    return .Ok(pipeline)
+}

@@ -1,0 +1,117 @@
+import Foundation
+import Ember
+
+// RB::render_primitive(Fill::Image): the image's texels under the coverage.
+// RB::Fill::Image::set_image maps the device pixel through the inverse of the
+// image transform followed by the draw's, into the unit square the texture
+// spans, and image_filter picks the sampler: interpolation 1, the default a
+// display list leaves unwritten, is linear at every scale (the
+// interpolation_filters table at 0x1b3288a18), clamped to the texture's edge;
+// none reads the nearest texel. The colour is the tint, white when there is
+// none, premultiplied and times the alpha (Fill::Color::prepare). Texels of
+// another colour space are converted as Image::sample converts them:
+// unpremultiplied, decoded, through the primaries' matrix, encoded and
+// premultiplied again. Image::set_image converts from the image's headroom
+// too, into the pass's; the pass has none, so nothing is tone mapped.
+function imagePaint(
+    session: borrow mut RenderSession,
+    fill: borrow ImageFill,
+    headroom: Number,
+    transform: borrow AffineTransform,
+    alpha: Number
+) -> Result<Paint, RenderFailure> {
+    let sampler = match imageSampler(session, fill.interpolation) {
+        Some(sampler) -> sampler
+        None -> return .Error(.UnportedFill)
+    }
+    let toDevice = fill.transform.concatenating(transform)
+    let fromDevice = match toDevice.inverted() {
+        Some(inverse) -> inverse
+        None -> return .Ok(.Solid(Surfaces.transparent))
+    }
+    let texture = match imageTexture(session, fill.image) {
+        Ok(texture) -> texture
+        Error(failure) -> return .Error(failure)
+    }
+    let tint = match fill.tint {
+        Some(color) -> copy color
+        None -> copy Surfaces.unclipped
+    }
+    let paint = TexturePaint {
+        texture: texture,
+        fromDevice: fromDevice,
+        color: premultiplied(tint, alpha),
+        sampler: sampler,
+        conversion: try imageConversion(session, fill.colorSpace, headroom)
+    }
+    return .Ok(.Textured(paint))
+}
+
+// The texels' conversion from the image's space and headroom into the
+// pass's: none when it changes nothing, or when the image's space is the
+// device's.
+function imageConversion(
+    session: borrow RenderSession,
+    colorSpace: ColorSpace,
+    headroom: Number
+) -> Result<[Number], RenderFailure> {
+    let space = try spaceCode(colorSpace) otherwise return .Ok(ImageConversion.none)
+    if space == session.colorSpace && headroom == 0 {
+        return .Ok(ImageConversion.none)
+    }
+    let conversion = try colorConversion(space, headroom, session.colorSpace, 0)
+    // A conversion that changes nothing sets no conversion in the globals.
+    if conversion.decode == conversion.encode && conversion.matrix == .None {
+        return .Ok(ImageConversion.none)
+    }
+    return .Ok(conversion.shaderFloats())
+}
+
+// The sampler for `interpolation`; the cubic and mipmapped filters, which
+// read four texels or a level chain, are not ported.
+function imageSampler(
+    session: borrow RenderSession,
+    interpolation: InterpolationMode
+) -> GraphicsSampler? {
+    return match interpolation {
+        None -> .Some(copy session.nearest)
+        Linear -> .Some(copy session.sampler)
+        LinearMipmap -> .None
+        Cubic -> .None
+        CubicMipmap -> .None
+        LowQuality -> .None
+        MediumQuality -> .None
+        HighQuality -> .None
+        LinearLevel -> .None
+        CubicLevel -> .None
+        Quadratic -> .None
+        QuadraticLevel -> .None
+        QuadraticMipmap -> .None
+    }
+}
+
+// The texture `image` is drawn from: a bitmap is uploaded for this render.
+function imageTexture(
+    session: borrow mut RenderSession,
+    image: borrow Image
+) -> Result<GraphicsTexture, RenderFailure> {
+    let bitmap = match image {
+        Bitmap(bitmap) -> bitmap
+        Texture(held) -> return .Ok(copy held.texture)
+    }
+    let descriptor = TextureDescriptor {
+        label: "renderbox-image",
+        width: bitmap.width,
+        height: bitmap.height,
+        format: textureFormat(bitmap.format)
+    }
+    let texture = match session.device.graphics().createTextureFromPixels(
+        descriptor,
+        bitmap.pixels
+    ) {
+        Ok(texture) -> texture
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.textures.append(copy texture)
+    return .Ok(texture)
+}

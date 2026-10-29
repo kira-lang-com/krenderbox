@@ -1,0 +1,185 @@
+// RenderBox's path_interior_vertex and path_interior_fragment: every
+// flattened edge of a path is a triangle fanned out from a pivot, adding one
+// to the accumulator where it faces one way and taking one away where it
+// faces the other, so the sum at each pixel is the path's winding number,
+// unantialiased.
+//
+// The segment buffer is the one path_exterior reads (see
+// `Shaders/PathExterior.ksl`).
+
+type PathGlobals {
+    // Path space to device pixels: x * matrix.xy + y * matrix.zw + translation.
+    let matrix: Float4
+    let translation: Float2
+    // Device pixels to clip space: x * scale.x - 1, 1 - y * scale.y.
+    let scale: Float2
+    // The point the triangles fan out from: the centre of the path's bounds.
+    let pivot: Float2
+    let depth: Float
+    // Where path_exterior's quads end on the right, in device pixels.
+    let right: Float
+    // 1 when the buffer holds points, 0 when it holds cubic segments.
+    let lines: Float
+    // How far path_distance measures from an edge, in path units.
+    let distance: Float
+}
+
+type PathSegment {
+    let first: Float
+    let step: Float
+    let control1: Float2
+    let control2: Float2
+    let end: Float2
+}
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+    // What the triangle adds: path_interior_shape's 1 for a front face, -1
+    // for a back one, by path_exterior's sense of a winding.
+    let winding: Float
+}
+
+// path_interior_fragment's half2.
+type FragmentOut {
+    let color: Half4
+}
+
+// The pivot, then the edge's start and its end.
+const triangleVertices: UInt = 3
+// What RenderBox stores where a subpath breaks.
+const infinite: Float = 3.0e38
+
+function isBreak(value: Float) -> Bool {
+    return abs(value) > infinite
+}
+
+// The cubic from `start` through the record's controls at `t`, in the
+// Bernstein form interior_vertex evaluates.
+function cubicAt(start: Float2, record: PathSegment, t: Float) -> Float2 {
+    let u = 1.0 - t
+    let middle = record.control1 * u + record.control2 * t
+    return start * (u * u * u) + middle * (t * 3.0 * u) + record.end * (t * t * t)
+}
+
+shader PathInterior {
+    group Path {
+        uniform pathGlobals: PathGlobals
+        storage read segments: [PathSegment]
+    }
+
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        // The float2 at `index` of a point buffer laid over the segment records.
+        function pointAt(index: UInt) -> Float2 {
+            let record = segments[index / UInt(4)]
+            let lane = index % UInt(4)
+            if lane == UInt(0) {
+                return Float2(record.first, record.step)
+            }
+            if lane == UInt(1) {
+                return record.control1
+            }
+            if lane == UInt(2) {
+                return record.control2
+            }
+            return record.end
+        }
+
+        // The last record whose first subdivision is at or before `index`.
+        function segmentFor(index: Float) -> UInt {
+            let base = UInt(1)
+            let count = UInt(segments[0].first)
+            while count > UInt(1) {
+                let half = count / UInt(2)
+                let middle = base + half
+                if segments[middle].first > index {
+                    count = half
+                } else {
+                    base = middle
+                    count = count - half
+                }
+            }
+            return base
+        }
+
+        function toDevice(point: Float2) -> Float2 {
+            return pathGlobals.matrix.xy * point.x + pathGlobals.matrix.zw * point.y + pathGlobals.translation
+        }
+
+        // The pivot, the edge's start or its end, by the vertex's corner.
+        function entry(input: VertexIn) -> VertexOut {
+            let edge = input.vid / triangleVertices
+            let corner = input.vid % triangleVertices
+            let from = Float2(0.0, 0.0)
+            let to = Float2(0.0, 0.0)
+            let valid = false
+            if pathGlobals.lines == 1.0 {
+                if UInt(segments[0].first) > edge {
+                    from = pointAt(edge + UInt(1))
+                    to = pointAt(edge + UInt(2))
+                    valid = !isBreak(from.x) && !isBreak(to.x)
+                }
+            } else {
+                if segments[0].step > Float(edge) {
+                    let at = segmentFor(Float(edge))
+                    let record = segments[at]
+                    if !isBreak(record.control1.x) {
+                        let start = segments[at - UInt(1)].end
+                        let index = Float(edge) - record.first
+                        from = cubicAt(start, record, record.step * index)
+                        to = cubicAt(start, record, record.step * (index + 1.0))
+                        valid = true
+                    }
+                }
+            }
+            let out: VertexOut
+            out.clip_position = Float4(-2.0, -2.0, 0.0, 1.0)
+            out.winding = 0.0
+            if !valid {
+                return out
+            }
+            let pivot = toDevice(pathGlobals.pivot)
+            let a = toDevice(from) - pivot
+            let b = toDevice(to) - pivot
+            // A triangle turning clockwise on the screen is an edge that
+            // path_exterior counts as going up past the pixels it encloses.
+            out.winding = 1.0
+            if a.x * b.y - a.y * b.x > 0.0 {
+                out.winding = -1.0
+            }
+            let point = pivot
+            if corner == UInt(1) {
+                point = pivot + a
+            }
+            if corner == UInt(2) {
+                point = pivot + b
+            }
+            out.clip_position = Float4(
+                point.x * pathGlobals.scale.x - 1.0,
+                1.0 - point.y * pathGlobals.scale.y,
+                pathGlobals.depth,
+                1.0,
+            )
+            return out
+        }
+    }
+
+    fragment {
+        input VertexOut
+        output FragmentOut
+
+        function entry(input: VertexOut) -> FragmentOut {
+            let result: FragmentOut
+            result.color = Half4(0.0, Half(input.winding), 0.0, 0.0)
+            return result
+        }
+    }
+}

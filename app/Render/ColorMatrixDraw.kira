@@ -1,0 +1,199 @@
+import Foundation
+import Ember
+
+// The colour's channels times its alpha, rounded to halves.
+function premultipliedHalves(color: borrow [Number]) -> [Number] {
+    let alpha = color[3]
+    return [
+        halfRounded(color[0] * alpha),
+        halfRounded(color[1] * alpha),
+        halfRounded(color[2] * alpha),
+        alpha
+    ]
+}
+
+// RB::Filter::ColorMatrix::set_globals. `linear` is set_color_fill_state's
+// answer for a linear filter in a pass that is not: this port's passes hold
+// encoded colours.
+function filterColorSetup(
+    m: borrow [Number],
+    premultiplied: Bool,
+    linear: Bool
+) -> FilterColorSetup {
+    if isDiagonal(m) {
+        let alpha = m[15]
+        let scaled = !premultiplied && !linear
+        let unscaled = [m[0], m[5], m[10], alpha]
+        let diagonal = scaled ? premultipliedHalves(unscaled) : unscaled
+        return innerState(FilterColorForms.scale, move diagonal, premultiplied, linear)
+    }
+    if isAlphaMultiply(m, premultiplied) {
+        var color = premultiplied ? [m[12], m[13], m[14], m[15]] : [m[16], m[17], m[18], m[15]]
+        if !premultiplied && !linear { color = premultipliedHalves(color) }
+        return innerState(FilterColorForms.alphaScale, move color, premultiplied, linear)
+    }
+    if !hasAlpha(m) {
+        if allZero(m, 16, 4) {
+            return FilterColorSetup {
+                mode: FilterColorForms.threeColumns,
+                halves: copy m,
+                linear: linear
+            }
+        }
+        if !premultiplied {
+            let mode = FilterColorForms.threeColumnsBiased
+            return FilterColorSetup { mode: mode, halves: copy m, linear: linear }
+        }
+    }
+    var setup = innerState(FilterColorForms.full, copy m, premultiplied, linear)
+    setup.unpremultiplyInner = !premultiplied && !linear
+    return setup
+}
+
+// A premultiplied matrix over a linear colour, which the fill state
+// unpremultiplied, is given it premultiplied again.
+function innerState(
+    mode: Number,
+    halves: [Number],
+    premultiplied: Bool,
+    linear: Bool
+) -> FilterColorSetup {
+    return FilterColorSetup {
+        mode: mode,
+        halves: halves,
+        linear: linear,
+        premultiplyInner: premultiplied && linear
+    }
+}
+
+extend FilterColorSetup {
+    // FilterColorGlobals' floats: the halves padded to six vectors, the form,
+    // the fill state, alpha-only, the target's scale and the pass's space.
+    function floats(width: Number, height: Number) -> [Number] {
+        var words = copy halves
+        while words.count < 24 {
+            words.append(0)
+        }
+        let outer = linear || unpremultiplyOuter ? 1 : 0
+        let transfer = linear ? 1 : 0
+        let inner = premultiplyInner ? 1 : 0
+        let undone = unpremultiplyInner ? 1 : 0
+        words.appendAll(
+            [mode, outer, transfer, inner, undone, 0, 1 / width, 1 / height, 0, 0, 0, 0]
+        )
+        return words
+    }
+}
+
+// ColorMatrixStyle::draw then the filter's render: `source` through the
+// style's matrix at `opacity`, into a surface of its own, and the alpha the
+// result is then composited at. An identity matrix is no filter, and the
+// source keeps the opacity.
+function colorMatrixFiltered(
+    session: borrow mut RenderSession,
+    source: GraphicsTexture,
+    style: borrow ColorMatrixStyle,
+    opacity: Number
+) -> Result<(GraphicsTexture, Number), RenderFailure> {
+    let columns = matrixColumns(style.matrix)
+    if columns == FilterColorForms.identity {
+        return .Ok((source, opacity))
+    }
+    let premultiplied = style.flags.has(ColorFilterFlags.premultiplied)
+    let scaled = opacity == 1 ? columns : alphaMultiplied(columns, opacity, premultiplied)
+    let setup = filterColorSetup(scaled, premultiplied, style.flags.has(ColorFilterFlags.linear))
+    let target = try filterColorPass(session, move source, setup)
+    return .Ok((target, 1))
+}
+
+function filterColorDraw(
+    session: borrow mut RenderSession,
+    setup: borrow FilterColorSetup,
+    source: borrow GraphicsTexture
+) -> Result<RecordedDraw, RenderFailure> {
+    let pipeline = try namedPipeline(
+        session,
+        FilterColorDrawing.pipeline,
+        ksl!("Shaders/FilterColor.ksl"),
+        ColorTargetDescriptor { format: session.format, blend: BlendState { enabled: false } }
+    )
+    let floats = setup.floats(Number(session.width), Number(session.height))
+    let uniform = try sessionUniform(
+        session,
+        "renderbox-filter-color-globals",
+        FilterColorDrawing.globalsFloatCount,
+        move floats
+    )
+    let graphics = session.device.graphics()
+    let bindGroup = match graphics.beginBindGroup("renderbox-filter-color") {
+        Ok(bindGroup) -> bindGroup
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    graphics.bindGroupAddUniform(bindGroup, FilterColorDrawing.globalsBinding, uniform)
+    graphics.bindGroupAddTexture(bindGroup, FilterColorDrawing.layerBinding, source)
+    graphics.bindGroupAddSampler(bindGroup, FilterColorDrawing.layerSamplerBinding, session.nearest)
+    graphics.bindGroupAddStorageBuffer(
+        bindGroup,
+        FilterColorDrawing.transferBinding,
+        session.transfer
+    )
+    session.bindGroups.append(copy bindGroup)
+    return .Ok(
+        RecordedDraw {
+            pipeline: pipeline,
+            bindGroup: bindGroup,
+            vertexCount: FilterColorDrawing.vertexCount
+        }
+    )
+}
+
+// The filters a state's styles hold, in the order they were added, each
+// applied to what the one before made. A shadow is lowered into items before
+// any is drawn, so one left among the filters is not ported.
+function filterStyles(styles: borrow [Style]) -> Result<[Style], RenderFailure> {
+    for style in styles {
+        match style {
+            Shadow(shadow) -> return .Error(.UnportedStyle)
+            ColorMatrix(matrix) -> {}
+            ColorClamp(clamp) -> {}
+            GradientMap(map) -> {}
+            Distance(distance) -> {}
+            ShaderFilter(filter) -> {}
+            AlphaThreshold(threshold) -> {}
+            Blur(blur) -> {}
+        }
+    }
+    return .Ok(copy styles)
+}
+
+// FilterStyle::draw then the filter's render: `source` through `style`, and
+// the alpha the result is then composited at.
+function styleFiltered(
+    session: borrow mut RenderSession,
+    source: GraphicsTexture,
+    style: borrow Style,
+    opacity: Number
+) -> Result<(GraphicsTexture, Number), RenderFailure> {
+    return match style {
+        Shadow(shadow) -> .Error(.UnportedStyle)
+        ColorMatrix(matrix) -> colorMatrixFiltered(session, move source, matrix, opacity)
+        ColorClamp(clamp) -> colorClampFiltered(session, move source, clamp, opacity)
+        GradientMap(map) -> gradientMapped(session, move source, map, opacity)
+        Distance(distance) -> distanceFiltered(session, move source, distance, opacity)
+        ShaderFilter(filter) -> shaderFiltered(session, move source, filter, opacity)
+        AlphaThreshold(threshold) -> alphaThresholded(session, move source, threshold, opacity)
+        Blur(blur) -> gaussianBlurred(session, move source, blur, opacity)
+    }
+}
+
+// A filter's setup run over `source` into a surface of its own.
+function filterColorPass(
+    session: borrow mut RenderSession,
+    source: GraphicsTexture,
+    setup: borrow FilterColorSetup
+) -> Result<GraphicsTexture, RenderFailure> {
+    let target = try surface(session, "renderbox-color-filter")
+    let draw = try filterColorDraw(session, setup, source)
+    try drawPass(session, target, Surfaces.transparent, [draw])
+    return .Ok(target)
+}

@@ -1,0 +1,72 @@
+import Foundation
+
+// RB::Shader::Tables: for each half's bits over eight, the sRGB transfer
+// function at the middle of those eight halves, as a half. The first table
+// encodes a linear value, the second decodes one; both map zero to zero and
+// one to one exactly.
+namespace TransferTables {
+    let entries: Number = 4096
+    // The entry of 1.0, 0x3c00 over eight.
+    let one: Number = 0x780
+    // Entries from here are infinity, then not numbers.
+    let infinite: Number = 0xf80
+    let infinityBits: UN32 = 0x7f800000
+    let notANumberBits: UN32 = 0x7fc00000
+    let encoding: Number = 0
+    let decoding: Number = 1
+}
+
+// The half with `bits`.
+function halfValue(bits: Number) -> Number {
+    let exponent = trunc(bits / 1024)
+    let mantissa = bits - exponent * 1024
+    if exponent == 0 {
+        return mantissa * pow(2, -24)
+    }
+    return (1 + mantissa / 1024) * pow(2, exponent - 15)
+}
+
+function srgbEncoded(x: Number) -> Number {
+    if x <= 0.0031308 {
+        return x * 12.92
+    }
+    return pow(x, 0.41667) * 1.055 - 0.055
+}
+
+function srgbDecoded(x: Number) -> Number {
+    if x <= 0.04045 {
+        return x * 0.07739938
+    }
+    return pow(x * 0.9478673 + 0.0521327, 2.4)
+}
+
+// Both tables as float words, the encoding first.
+function transferTableWords() -> [UN32] {
+    var words: [UN32] = []
+    for table in [TransferTables.encoding, TransferTables.decoding] {
+        for index in 0..TransferTables.entries {
+            if index >= TransferTables.infinite {
+                let infinite = index == TransferTables.infinite
+                words.append(infinite ? TransferTables.infinityBits : TransferTables.notANumberBits)
+                continue
+            }
+            words.append(floatWord(transferEntry(index, table)))
+        }
+    }
+    return words
+}
+
+// Entry `index` of `table`, below the infinite ones.
+function transferEntry(index: Number, table: Number) -> Number {
+    if index == 0 {
+        return 0
+    }
+    if index == TransferTables.one {
+        return 1
+    }
+    let x = halfValue(index * 8 + 4)
+    if table == TransferTables.encoding {
+        return halfRounded(srgbEncoded(x))
+    }
+    return halfRounded(srgbDecoded(x))
+}

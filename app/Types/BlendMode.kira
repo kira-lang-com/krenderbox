@@ -1,0 +1,102 @@
+import Foundation
+
+// RBBlendMode. The first twenty-eight are Core Graphics' blend modes under
+// CGBlendMode's own codes; the modes RenderBox adds start at a thousand.
+// The codes are what a recorded display list stores.
+public enum BlendMode: UN32 {
+    Normal = 0
+    Multiply = 1
+    Screen = 2
+    Overlay = 3
+    Darken = 4
+    Lighten = 5
+    ColorDodge = 6
+    ColorBurn = 7
+    SoftLight = 8
+    HardLight = 9
+    Difference = 10
+    Exclusion = 11
+    Hue = 12
+    Saturation = 13
+    Color = 14
+    Luminosity = 15
+    Clear = 16
+    Copy = 17
+    SourceIn = 18
+    SourceOut = 19
+    SourceAtop = 20
+    DestinationOver = 21
+    DestinationIn = 22
+    DestinationOut = 23
+    DestinationAtop = 24
+    Xor = 25
+    PlusDarker = 26
+    PlusLighter = 27
+    LinearDodge = 1000
+    LinearBurn = 1001
+    LinearLight = 1002
+    PinLight = 1003
+    Subtract = 1004
+    Divide = 1005
+    Maximum = 1006
+    Add = 1007
+    SubtractSource = 1008
+    SubtractDestination = 1009
+    DarkenSource = 1010
+    LightenSource = 1011
+    Minimum = 1012
+    MinimumInverse = 1013
+    PlusLighterIgnoringAlpha = 1014
+    PlusDarkerIgnoringAlpha = 1015
+    SubtractSourceIgnoringAlpha = 1016
+    DistanceFieldMaximum = 1017
+    DistanceFieldMinimum = 1018
+    DistanceFieldMinimumInverse = 1019
+    ShaderNormal = 1020
+    ShaderComplex = 1021
+}
+
+// RB::BlendMode, RenderBox's internal numbering, from rb_blend_mode: the Core
+// Graphics codes through `cg_table`, RenderBox's own through `custom_table`.
+namespace InternalBlendModes {
+    let coreGraphics: [Number] = [
+        2, 25, 12, 26, 27, 28, 29, 30, 31, 32, 33, 14, 36, 37, 38, 39, 1, 0, 3, 4, 5, 6, 7, 8, 9,
+        10, 44, 43
+    ]
+    let renderBox: [Number] = [
+        13, 40, 41, 42, 34, 35, 15, 11, 17, 18, 45, 46, 16, 47, 48, 49, 50, 51, 52, 53, 54, 55
+    ]
+    let firstRenderBoxCode: Number = 1000
+    // RB::may_discard_shape and RB::may_discard_alpha: a set bit marks a mode
+    // that leaves the destination as it is where the source is clear, so
+    // fragments outside the shape need not be drawn. Modes past each mask's
+    // last bit all may.
+    let shapeDiscarding: Number = 0x47ffff
+    let lastShapeDiscardingBit: Number = 23
+    let alphaDiscarding: Number = 0x6fffffff46fd64
+    let lastAlphaDiscardingBit: Number = 55
+}
+
+public function internalBlendMode(mode: BlendMode) -> Number {
+    let raw: Number = code(mode)
+    if raw < InternalBlendModes.firstRenderBoxCode {
+        return InternalBlendModes.coreGraphics[raw]
+    }
+    return InternalBlendModes.renderBox[raw - InternalBlendModes.firstRenderBoxCode]
+}
+
+function maskHas(mask: Number, lastBit: Number, bit: Number) -> Bool {
+    return bit > lastBit || ((mask >> bit) & 1) == 1
+}
+
+// RB::may_discard_shape(BlendMode).
+public function mayDiscardShape(mode: BlendMode) -> Bool {
+    let lastBit = InternalBlendModes.lastShapeDiscardingBit
+    return maskHas(InternalBlendModes.shapeDiscarding, lastBit, internalBlendMode(mode))
+}
+
+// RB::may_discard_alpha(BlendMode).
+public function mayDiscardAlpha(mode: BlendMode) -> Bool {
+    let lastBit = InternalBlendModes.lastAlphaDiscardingBit
+    return maskHas(InternalBlendModes.alphaDiscarding, lastBit, internalBlendMode(mode))
+}

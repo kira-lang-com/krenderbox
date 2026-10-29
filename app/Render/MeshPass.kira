@@ -1,0 +1,187 @@
+import Foundation
+import Ember
+
+// The depth each mesh pipeline tests against and writes. The depth is
+// cleared to zero, which no patch or triangle draws at.
+function meshDepth(compare: CompareFunction, write: Bool) -> DepthStencilDescriptor {
+    return DepthStencilDescriptor {
+        depthEnabled: true,
+        depthWriteEnabled: write,
+        depthCompare: compare,
+        format: .Depth24Stencil8
+    }
+}
+
+// render_mesh_gradient's pipelines: the latest depth kept at each pixel,
+// then the colour where a fragment's depth is that one; triangles drawn
+// over each other in order; and the background where nothing drew.
+function meshPipeline(
+    session: borrow mut RenderSession,
+    name: String
+) -> Result<RenderPipeline, RenderFailure> {
+    let replaced = ColorTargetDescriptor {
+        format: .Rgba16Float,
+        blend: BlendState { enabled: false }
+    }
+    let depth = match name {
+        "renderbox-mesh-depth" -> meshDepth(.Greater, true)
+        "renderbox-mesh-color" -> meshDepth(.Equal, false)
+        "renderbox-mesh-triangles" -> meshDepth(.Always, true)
+        else -> meshDepth(.Equal, false)
+    }
+    let target = name == MeshDrawing.trianglePipeline ? ColorTargetDescriptor {
+        format : .Rgba16Float,
+        blend: BlendState { enabled: true }
+    }: move replaced
+    return namedDepthPipeline(
+        session,
+        move name,
+        ksl!("Shaders/MeshGradient.ksl"),
+        move target,
+        move depth
+    )
+}
+
+// MeshGlobals in `Shaders/MeshGradient.ksl`'s packing.
+function meshGlobals(
+    session: borrow RenderSession,
+    geometry: borrow MeshGeometry,
+    toDevice: borrow AffineTransform,
+    state: borrow (Number, Number),
+    background: borrow RGBAColor
+) -> [Number] {
+    let side = pow(2, geometry.level)
+    let cells = side * side
+    let last = geometry.mode == 2 ? 0 : trunc(geometry.vertices / MeshDrawing.cellVertices) - 1
+    return [
+        toDevice.a, toDevice.b, toDevice.c, toDevice.d,
+        toDevice.tx, toDevice.ty, 2 / Number(session.width), 2 / Number(session.height),
+        last, cells, side, 1 / side,
+        MeshDrawing.depthBase, geometry.mode, state.0, state.1,
+        background.r, background.g, background.b, background.a
+    ]
+}
+
+function meshDraws(
+    session: borrow mut RenderSession,
+    geometry: borrow MeshGeometry,
+    toDevice: borrow AffineTransform,
+    state: borrow (Number, Number),
+    background: borrow RGBAColor
+) -> Result<[RecordedDraw], RenderFailure> {
+    let floats = meshGlobals(session, geometry, toDevice, state, background)
+    let bindGroup = try boundMesh(session, move floats, geometry.floats)
+    var draws: [RecordedDraw] = []
+    var pipelines: [String] = [MeshDrawing.depthPipeline, MeshDrawing.colorPipeline]
+    if geometry.mode == 2 {
+        pipelines = [MeshDrawing.trianglePipeline]
+    }
+    if geometry.vertices > 0 {
+        for name in pipelines {
+            let pipeline = try meshPipeline(session, copy name)
+            draws.append(
+                RecordedDraw {
+                    pipeline: pipeline,
+                    bindGroup: copy bindGroup,
+                    vertexCount: UN32(geometry.vertices)
+                }
+            )
+        }
+    }
+    if background.a != 0 {
+        draws.append(try backgroundDraw(session, toDevice, state, background))
+    }
+    return .Ok(draws)
+}
+
+// The background over the whole target, drawn where no patch did.
+function backgroundDraw(
+    session: borrow mut RenderSession,
+    toDevice: borrow AffineTransform,
+    state: borrow (Number, Number),
+    background: borrow RGBAColor
+) -> Result<RecordedDraw, RenderFailure> {
+    let backdrop = MeshGeometry { floats: [], vertices: 0, mode: 3, level: 0 }
+    let floats = meshGlobals(session, backdrop, toDevice, state, background)
+    let bindGroup = try boundMesh(session, move floats, [])
+    let pipeline = try meshPipeline(session, MeshDrawing.backgroundPipeline)
+    return .Ok(
+        RecordedDraw {
+            pipeline: pipeline,
+            bindGroup: bindGroup,
+            vertexCount: MeshDrawing.backgroundVertices
+        }
+    )
+}
+
+// The mesh's bindings.
+function boundMesh(
+    session: borrow mut RenderSession,
+    floats: [Number],
+    mesh: borrow [Number]
+) -> Result<BindGroup, RenderFailure> {
+    var words: [UN32] = []
+    for value in mesh { words.append(floatWord(value)) }
+    // A storage binding cannot be empty.
+    if words.count == 0 {
+        words.append(0)
+    }
+    let graphics = session.device.graphics()
+    let buffer = match graphics.createStorageBufferWords("renderbox-mesh", words) {
+        Ok(buffer) -> buffer
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.buffers.append(copy buffer)
+    let count = MeshDrawing.globalsFloatCount
+    let uniform = try sessionUniform(session, "renderbox-mesh-globals", count, move floats)
+    let bindGroup = match graphics.beginBindGroup("renderbox-mesh") {
+        Ok(bindGroup) -> bindGroup
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    graphics.bindGroupAddUniform(bindGroup, MeshDrawing.globalsBinding, uniform)
+    graphics.bindGroupAddStorageBuffer(bindGroup, MeshDrawing.meshBinding, buffer)
+    graphics.bindGroupAddTexture(bindGroup, MeshDrawing.noiseBinding, session.noise)
+    graphics.bindGroupAddSampler(bindGroup, MeshDrawing.noiseSamplerBinding, session.tiling)
+    graphics.bindGroupAddStorageBuffer(bindGroup, MeshDrawing.transferBinding, session.transfer)
+    session.bindGroups.append(copy bindGroup)
+    return .Ok(bindGroup)
+}
+
+// `draws` into `target` cleared to transparent, over a depth attachment
+// cleared to zero.
+function meshPass(
+    session: borrow mut RenderSession,
+    target: borrow GraphicsTexture,
+    draws: borrow [RecordedDraw]
+) -> Result<Void, RenderFailure> {
+    let depth = try pooledSurface(
+        session,
+        TextureDescriptor {
+            label: "renderbox-mesh-depth",
+            width: session.width,
+            height: session.height,
+            format: .Depth24Stencil8,
+            usage: .DepthStencil
+        }
+    )
+    var descriptor = clearTextureRenderPass(target, Surfaces.transparent)
+    descriptor.depthAttachment = DepthAttachment {
+        texture: depth,
+        storeAction: .DontCare,
+        clearDepth: 0
+    }
+    descriptor.hasDepthAttachment = true
+    var frame = match session.device.frame() {
+        Ok(frame) -> frame
+        Error(failure) -> return .Error(.Device(failure))
+    }
+    let encoder = frame.beginRenderPass(descriptor)
+    for draw in draws {
+        encoder.setPipeline(draw.pipeline)
+        encoder.setBindGroup(PrimitiveDrawing.group, draw.bindGroup)
+        encoder.draw(draw.vertexCount)
+    }
+    frame.endPass()
+    session.device.submit()
+    return .Ok
+}

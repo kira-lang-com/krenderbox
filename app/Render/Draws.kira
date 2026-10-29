@@ -1,0 +1,195 @@
+import Foundation
+import Ember
+
+// A primitive draw's globals, paint and clip mask bound for the GPU, through
+// the pipeline for `blend`. An empty primitive the blend may skip draws
+// nothing.
+function recordedDraw(
+    session: borrow mut RenderSession,
+    draw: PrimitiveDraw,
+    paint: Paint,
+    mask: GraphicsTexture?,
+    blend: BlendMode
+) -> Result<RecordedDraw?, RenderFailure> {
+    var globals = match draw {
+        Nothing -> return .Ok(.None)
+        Quad(globals) -> globals
+    }
+    let fillSampler = paintSampler(paint, session.sampler)
+    let fill = painted(globals, paint, session.white)
+    let maskTexture = masked(globals, mask, session)
+    let (written, destination) = match shaderBlended(globals, blend) {
+        Ok(chosen) -> chosen
+        Error(failure) -> return .Error(failure)
+    }
+    let pipeline = match pipelineFor(session, written) {
+        Ok(pipeline) -> pipeline
+        Error(failure) -> return .Error(failure)
+    }
+    let bindGroup = match boundDraw(session, globals, fill, fillSampler, maskTexture) {
+        Ok(bindGroup) -> bindGroup
+        Error(failure) -> return .Error(failure)
+    }
+    let recorded = RecordedDraw {
+        pipeline: pipeline,
+        bindGroup: bindGroup,
+        vertexCount: PrimitiveDrawing.vertexCount,
+        destination: destination
+    }
+    return .Ok(.Some(recorded))
+}
+
+// The blend the pipeline is made for and what the draw reads as its
+// destination. A mode RenderBox blends in the shader is written through,
+// the fragment mixing the destination and the blend by coverage.
+function shaderBlended(globals: borrow mut PrimitiveGlobals, blend: BlendMode) -> Result<(
+    BlendMode, DestinationSlot
+), RenderFailure> {
+    match hardwareBlend(blend) {
+        WriteThrough -> return .Ok((blend, .Unused))
+        Function(fixed) -> return .Ok((blend, .Unused))
+        Shader -> {}
+    }
+    let code = internalBlendMode(blend)
+    if !ShaderBlends.ported.contains(code) {
+        return .Error(.ShaderBlend(blend))
+    }
+    globals.blendCode = code
+    globals.shaderBlend = true
+    return .Ok((.Copy, .Wanted))
+}
+
+// Sets the globals' paint and answers the texture the fill samples.
+function painted(
+    globals: borrow mut PrimitiveGlobals,
+    paint: borrow Paint,
+    white: borrow GraphicsTexture
+) -> GraphicsTexture {
+    match paint {
+        Solid(color) -> {
+            globals.color = copy color
+            globals.textured = false
+            return copy white
+        }
+        Textured(textured) -> {
+            globals.color = copy textured.color
+            globals.fill = copy textured.fromDevice
+            globals.textured = true
+            globals.conversion = copy textured.conversion
+            return copy textured.texture
+        }
+    }
+}
+
+// Sets whether the clip mask applies and answers the texture it samples.
+function masked(
+    globals: borrow mut PrimitiveGlobals,
+    mask: borrow GraphicsTexture?,
+    session: borrow RenderSession
+) -> GraphicsTexture {
+    globals.maskScale = Point { x: 1 / Number(session.width), y: 1 / Number(session.height) }
+    match mask {
+        Some(texture) -> {
+            globals.masked = true
+            return copy texture
+        }
+        None -> {
+            globals.masked = false
+            return copy session.white
+        }
+    }
+}
+
+// The globals in a uniform of their own, with the fill and mask textures,
+// in one bind group.
+function boundDraw(
+    session: borrow mut RenderSession,
+    globals: borrow PrimitiveGlobals,
+    fill: borrow GraphicsTexture,
+    fillSampler: borrow GraphicsSampler,
+    mask: borrow GraphicsTexture
+) -> Result<BindGroup, RenderFailure> {
+    let graphics = session.device.graphics()
+    let made = graphics.createUniform(
+        UniformDescriptor {
+            label: "renderbox-primitive-globals",
+            expectedFloatCount: PrimitiveDrawing.globalsFloatCount,
+            data: globals.floats()
+        }
+    )
+    let uniform = match made {
+        Ok(uniform) -> uniform
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.uniforms.append(copy uniform)
+    let bound = graphics.createBindGroup(
+        drawBindings(move uniform, fill, fillSampler, mask, session.sampler)
+    )
+    let bindGroup = match bound {
+        Ok(bindGroup) -> bindGroup
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.bindGroups.append(copy bindGroup)
+    return .Ok(bindGroup)
+}
+
+function drawBindings(
+    uniform: GraphicsUniform,
+    fill: borrow GraphicsTexture,
+    fillSampler: borrow GraphicsSampler,
+    mask: borrow GraphicsTexture,
+    maskSampler: borrow GraphicsSampler
+) -> BindGroupDescriptor {
+    return BindGroupDescriptor {
+        label: "renderbox-primitive-draw",
+        uniformEntries: [
+            UniformBindEntry { uniformSlot: PrimitiveDrawing.globalsBinding, uniform: uniform }
+        ],
+        textureEntries: [
+            TextureBindEntry { textureSlot: PrimitiveDrawing.fillBinding, texture: copy fill },
+            TextureBindEntry { textureSlot: PrimitiveDrawing.maskBinding, texture: copy mask }
+        ],
+        samplerEntries: [
+            SamplerBindEntry {
+                samplerSlot: PrimitiveDrawing.fillSamplerBinding,
+                sampler: copy fillSampler
+            },
+            SamplerBindEntry {
+                samplerSlot: PrimitiveDrawing.maskSamplerBinding,
+                sampler: copy maskSampler
+            }
+        ]
+    }
+}
+
+// The pipeline drawing through `blend`'s fixed-function state, made the first
+// time a draw asks for it.
+function pipelineFor(
+    session: borrow mut RenderSession,
+    blend: BlendMode
+) -> Result<RenderPipeline, RenderFailure> {
+    for (served, pipeline) in session.pipelines {
+        if served == blend {
+            return .Ok(copy pipeline)
+        }
+    }
+    let state = match hardwareBlend(blend) {
+        WriteThrough -> BlendState { enabled: false }
+        Function(blendFunction) -> BlendState { enabled: true, custom: .Some(blendFunction) }
+        Shader -> return .Error(.ShaderBlend(blend))
+    }
+    let made = session.device.graphics().createRenderPipeline(
+        RenderPipelineDescriptor {
+            label: "renderbox-primitive",
+            shader: copy session.shader,
+            colorTargets: [ColorTargetDescriptor { format: session.format, blend: state }],
+            depthStencil: DepthStencilDescriptor { depthCompare: .Always }
+        }
+    )
+    let pipeline = match made {
+        Ok(pipeline) -> pipeline
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.pipelines.append((blend, copy pipeline))
+    return .Ok(pipeline)
+}

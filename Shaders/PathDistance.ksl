@@ -1,0 +1,237 @@
+// RenderBox's path_distance_vertex and path_distance_fragment: every
+// flattened edge of a path draws a quad reaching the rendering mode's
+// distance either side of it, and each pixel in it keeps one less its
+// distance from the edge, over that distance, so the largest any edge gives
+// (the pass blends by maximum) is how near the pixel is to the path's
+// outline. path_interior then adds the winding under it.
+//
+// A quad reaches the distance past an edge's ends only where the edge ends
+// the curve it was flattened from; between two of a curve's edges it stops
+// square to the curve's tangent there. The segment buffer is the one
+// path_exterior reads (see `Shaders/PathExterior.ksl`).
+
+type PathGlobals {
+    // Path space to device pixels: x * matrix.xy + y * matrix.zw + translation.
+    let matrix: Float4
+    let translation: Float2
+    // Device pixels to clip space: x * scale.x - 1, 1 - y * scale.y.
+    let scale: Float2
+    // The point path_interior's triangles fan out from.
+    let pivot: Float2
+    let depth: Float
+    // Where path_exterior's quads end on the right, in device pixels.
+    let right: Float
+    // 1 when the buffer holds points, 0 when it holds cubic segments.
+    let lines: Float
+    // How far the distance is measured from an edge, in path units.
+    let distance: Float
+}
+
+type PathSegment {
+    let first: Float
+    let step: Float
+    let control1: Float2
+    let control2: Float2
+    let end: Float2
+}
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+    // The vertex from the edge's start, and the edge, in distances.
+    let offset: Float2
+    let edge: Float2
+    // One over the edge's squared length in distances.
+    let denominator: Float
+}
+
+// path_distance_fragment's half2.
+type FragmentOut {
+    let color: Half4
+}
+
+// Two triangles per edge over corners 0 1 2 and 0 2 3: 0 and 3 at the
+// edge's start, 1 and 2 at its end, 0 and 1 on its left.
+const quadVertices: UInt = 6
+// What RenderBox stores where a subpath breaks.
+const infinite: Float = 3.0e38
+// path_distance_fragment's least distance, a half's 0x1626: the nearest a
+// pixel comes keeps the winding path_interior adds whole.
+const nearest: Float = 0.001501083374
+
+function isBreak(value: Float) -> Bool {
+    return abs(value) > infinite
+}
+
+// The edge's points and the direction its quad runs in, in path space, and
+// whether there is an edge.
+type DistanceEdge {
+    let from: Float2
+    let to: Float2
+    let direction: Float2
+    // 1 where the edge's end is inside the curve and the quad stops there.
+    let joined: Float
+    let valid: Bool
+}
+
+shader PathDistance {
+    group Path {
+        uniform pathGlobals: PathGlobals
+        storage read segments: [PathSegment]
+    }
+
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        // The float2 at `index` of a point buffer laid over the segment records.
+        function pointAt(index: UInt) -> Float2 {
+            let record = segments[index / UInt(4)]
+            let lane = index % UInt(4)
+            if lane == UInt(0) {
+                return Float2(record.first, record.step)
+            }
+            if lane == UInt(1) {
+                return record.control1
+            }
+            if lane == UInt(2) {
+                return record.control2
+            }
+            return record.end
+        }
+
+        // The last record whose first subdivision is at or before `index`.
+        function segmentFor(index: Float) -> UInt {
+            let base = UInt(1)
+            let count = UInt(segments[0].first)
+            while count > UInt(1) {
+                let half = count / UInt(2)
+                let middle = base + half
+                if segments[middle].first > index {
+                    count = half
+                } else {
+                    base = middle
+                    count = count - half
+                }
+            }
+            return base
+        }
+
+        function lineEdge(edge: UInt) -> DistanceEdge {
+            let result: DistanceEdge
+            result.valid = false
+            result.joined = 0.0
+            if UInt(segments[0].first) > edge {
+                result.from = pointAt(edge + UInt(1))
+                result.to = pointAt(edge + UInt(2))
+                result.direction = result.to - result.from
+                result.valid = !isBreak(result.from.x) && !isBreak(result.to.x)
+            }
+            return result
+        }
+
+        // distance_vertex's cubic in the power basis: the edge's ends at its
+        // two parameters, and the curve's tangent at the quad's end when
+        // that end is inside the curve.
+        function cubicEdge(edge: UInt, start: Bool) -> DistanceEdge {
+            let result: DistanceEdge
+            result.valid = false
+            result.joined = 0.0
+            if segments[0].step <= Float(edge) {
+                return result
+            }
+            let at = segmentFor(Float(edge))
+            let record = segments[at]
+            if isBreak(record.control1.x) {
+                return result
+            }
+            let p0 = segments[at - UInt(1)].end
+            let b = (record.control1 - p0) * 3.0
+            let c = ((record.control2 - record.control1) - (record.control1 - p0)) * 3.0
+            let d = (record.end - record.control2) - (record.control2 - record.control1) * 2.0 + (record.control1 - p0)
+            let t0 = record.step * (Float(edge) - record.first)
+            let t1 = record.step * (Float(edge) - record.first + 1.0)
+            result.from = ((d * t0 + c) * t0 + b) * t0 + p0
+            result.to = ((d * t1 + c) * t1 + b) * t1 + p0
+            result.direction = result.to - result.from
+            let t = t1
+            let inside = t1 < 1.0
+            if start {
+                t = t0
+                inside = t0 > 0.0
+            }
+            if inside {
+                result.direction = (d * (t * 3.0) + c * 2.0) * t + b
+                result.joined = 1.0
+            }
+            result.valid = true
+            return result
+        }
+
+        function entry(input: VertexIn) -> VertexOut {
+            let edge = input.vid / quadVertices
+            let corner = input.vid % quadVertices
+            if corner == UInt(3) {
+                corner = UInt(0)
+            }
+            if corner > UInt(3) {
+                corner = corner - UInt(2)
+            }
+            let start = corner == UInt(0) || corner == UInt(3)
+            let found = cubicEdge(edge, start)
+            if pathGlobals.lines == 1.0 {
+                found = lineEdge(edge)
+            }
+            let out: VertexOut
+            out.clip_position = Float4(-2.0, -2.0, 0.0, 1.0)
+            out.offset = Float2(0.0, 0.0)
+            out.edge = Float2(0.0, 0.0)
+            out.denominator = 0.0
+            if !found.valid {
+                return out
+            }
+            let reach = pathGlobals.distance
+            let along = normalize(found.direction) * reach
+            let across = Float2(-along.y, along.x)
+            if corner > UInt(1) {
+                across = -across
+            }
+            let past = along * (1.0 - found.joined)
+            let point = found.to + past + across
+            if start {
+                point = found.from - past + across
+            }
+            out.offset = (point - found.from) / reach
+            out.edge = (found.to - found.from) / reach
+            out.denominator = 1.0 / dot(out.edge, out.edge)
+            let device = pathGlobals.matrix.xy * point.x + pathGlobals.matrix.zw * point.y + pathGlobals.translation
+            out.clip_position = Float4(
+                device.x * pathGlobals.scale.x - 1.0,
+                1.0 - device.y * pathGlobals.scale.y,
+                pathGlobals.depth,
+                1.0,
+            )
+            return out
+        }
+    }
+
+    fragment {
+        input VertexOut
+        output FragmentOut
+
+        function entry(input: VertexOut) -> FragmentOut {
+            let t = clamp(dot(input.offset, input.edge) * input.denominator, 0.0, 1.0)
+            let away = clamp(length(input.offset - input.edge * t), 0.0, 1.0)
+            // The distance as a half, and the rest in halves.
+            let near = Half(1.0) - max(Half(away), Half(nearest))
+            let result: FragmentOut
+            result.color = Half4(0.0, near, 0.0, 0.0)
+            return result
+        }
+    }
+}

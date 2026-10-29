@@ -1,0 +1,182 @@
+import Foundation
+
+// RB::ColorSpace, a byte: the transfer function in the high nibble and the
+// primaries in the low.
+namespace SpaceCodes {
+    let gray: Number = 0x10
+    let standardRgb: Number = 0x11
+    let linearRgb: Number = 0x01
+    // rb_color_space's table from RBColorSpace 1 to 17. Device has no space.
+    let byPublic: [Number] = [
+        0x11, 0x01, 0x12, 0x02, 0x51, 0x53, 0x13, 0x03, 0x23, 0x33, 0x52, 0x77, 0x88, 0x66, 0x41, 0x10,
+        0x00
+    ]
+    // Transfer nibbles from here on are parametric gammas.
+    let parametricBits: Number = 0xc0
+}
+
+// The transfer functions Conversion decodes and encodes by.
+namespace Transfers {
+    let linear: Number = 0
+    let standardRgb: Number = 1
+    let parametric: Number = 4
+}
+
+// RB::ColorSpace::Conversion: decode by the source's transfer, the matrix
+// from its primaries to the destination's, encode by the destination's.
+struct ColorConversion {
+    let decode: Number
+    let encode: Number
+    // Column by column; none when the primaries match.
+    let matrix: [Number]?
+}
+
+// The space a render works in: `space`, or for the device what RBDrawable
+// works in when given none, linear sRGB for a half-float target and sRGB
+// for one of bytes.
+function workingSpace(space: ColorSpace, format: PixelFormat) -> Number {
+    let fallback = format == .Rgba16Float ? SpaceCodes.linearRgb : SpaceCodes.standardRgb
+    return try spaceCode(space) otherwise fallback
+}
+
+function spaceCode(space: ColorSpace) -> Number? {
+    let index = Number(code(space))
+    if index == 0 {
+        return .None
+    }
+    return .Some(SpaceCodes.byPublic[index - 1])
+}
+
+// Conversion's constructor. Tone mapping, which it does only when the
+// destination's headroom is less than the source's and not zero, the
+// parametric gammas, PQ and HLG are not ported.
+function colorConversion(
+    from: Number,
+    fromHeadroom: Number,
+    to: Number,
+    toHeadroom: Number
+) -> Result<ColorConversion, RenderFailure> {
+    if toHeadroom < fromHeadroom && toHeadroom != 0 {
+        return .Error(.UnportedColorSpace)
+    }
+    let primaries = conversionMatrix(from & 0xf, to & 0xf)
+    if from == SpaceCodes.gray && to == SpaceCodes.standardRgb {
+        return .Ok(
+            ColorConversion {
+                decode: Transfers.linear,
+                encode: Transfers.linear,
+                matrix: primaries
+            }
+        )
+    }
+    let decode = transferOf(from)
+    let encode = transferOf(to)
+    if decode > Transfers.standardRgb || encode > Transfers.standardRgb {
+        return .Error(.UnportedColorSpace)
+    }
+    return .Ok(ColorConversion { decode: decode, encode: encode, matrix: primaries })
+}
+
+function transferOf(space: Number) -> Number {
+    if (space & SpaceCodes.parametricBits) != 0 {
+        return Transfers.parametric
+    }
+    return space >> 4
+}
+
+function conversionMatrix(from: Number, to: Number) -> [Number]? {
+    if from == to {
+        return .None
+    }
+    let start = (from * PrimariesMatrices.count + to) * 9
+    var columns: [Number] = []
+    for index in start..start + 9 {
+        columns.append(PrimariesMatrices.entries[index])
+    }
+    return .Some(columns)
+}
+
+// RB::Shader::Image::sample's conversion as the paint shaders read it: a
+// Float4 of whether to convert, whether to decode and encode by the sRGB
+// tables, then the primaries matrix column by column, each column a Float4.
+namespace ImageConversion {
+    let none: [Number] = [0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]
+    let floatCount: Number = 16
+}
+
+extend ColorConversion {
+    function shaderFloats() -> [Number] {
+        let columns = match matrix {
+            Some(columns) -> copy columns
+            None -> [1, 0, 0, 0, 1, 0, 0, 0, 1]
+        }
+        return [
+            1, decode == Transfers.standardRgb ? 1 : 0, encode == Transfers.standardRgb ? 1 : 0, 0,
+            columns[0], columns[1], columns[2], 0,
+            columns[3], columns[4], columns[5], 0,
+            columns[6], columns[7], columns[8], 0
+        ]
+    }
+
+    // The operator on halves: an sRGB decode and encode read
+    // RB::Shader::Tables at each half's bits over eight, keeping the sign.
+    function converted(color: borrow RGBAColor) -> RGBAColor {
+        if decode == encode {
+            match matrix {
+                Some(columns) -> {}
+                None -> return copy color
+            }
+        }
+        let rgb = [decoded(color.r), decoded(color.g), decoded(color.b)]
+        let mixed = match matrix {
+            Some(columns) -> multiplied(columns, rgb)
+            None -> copy rgb
+        }
+        return RGBAColor {
+            r: encoded(mixed[0]),
+            g: encoded(mixed[1]),
+            b: encoded(mixed[2]),
+            a: color.a
+        }
+    }
+
+    function decoded(value: Number) -> Number {
+        if decode == Transfers.standardRgb {
+            return tableLookup(halfRounded(value), TransferTables.decoding)
+        }
+        return value
+    }
+
+    function encoded(value: Number) -> Number {
+        let half = halfRounded(value)
+        if encode == Transfers.standardRgb {
+            return tableLookup(half, TransferTables.encoding)
+        }
+        return half
+    }
+}
+
+function multiplied(columns: borrow [Number], rgb: borrow [Number]) -> [Number] {
+    var result: [Number] = []
+    for row in 0..3 {
+        result.append(columns[row] * rgb[0] + columns[3 + row] * rgb[1] + columns[6 + row] * rgb[2])
+    }
+    return result
+}
+
+// The entry of `table` for the half |value|, with value's sign.
+function tableLookup(value: Number, table: Number) -> Number {
+    let entry = transferEntry(trunc(halfBits(abs(value)) / 8), table)
+    return value < 0 ? -entry : entry
+}
+
+// A half's bits, from its value.
+function halfBits(half: Number) -> Number {
+    if half < pow(2, HalfFloat.normalExponent) {
+        return half * pow(2, 24)
+    }
+    let bits = UN32(floatToBits32(F32(half)))
+    let exponent = Number((bits >> HalfFloat.floatMantissa) & 0xff) - HalfFloat.floatBias
+    let mantissa = Number((bits >> (HalfFloat.floatMantissa - HalfFloat.halfMantissa)) & 0x3ff)
+    return (exponent + 15) * 1024 + mantissa
+}

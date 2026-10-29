@@ -1,0 +1,434 @@
+import Foundation
+import Ember
+
+// Why a display list could not be drawn.
+public enum RenderFailure {
+    Device(HeadlessFailure)
+    Resource(ResourceFailure)
+    Readback(CaptureFailure)
+    Primitive(PrimitiveFailure)
+    // A mode RenderBox blends in the shader, reading the destination: not
+    // ported yet.
+    ShaderBlend(BlendMode)
+    ShaderFill(ShaderFillFailure)
+    // Fills, shapes, layers and styles drawn by paths not ported yet.
+    UnportedFill
+    UnportedShape
+    UnportedLayer
+    UnportedStyle
+    // A conversion between colour spaces that tone maps, or uses a
+    // transfer function other than linear or sRGB.
+    UnportedColorSpace
+}
+
+namespace PrimitiveDrawing {
+    // Two triangles over the quad, as primitive__vertex numbers them.
+    let vertexCount: UN32 = 6
+    // `group Draw` in `Shaders/Primitive.ksl`, its bindings in order.
+    let group: UN32 = 0
+    let globalsBinding: UN32 = 0
+    let fillBinding: UN32 = 1
+    let fillSamplerBinding: UN32 = 2
+    let maskBinding: UN32 = 3
+    let maskSamplerBinding: UN32 = 4
+    let globalsFloatCount: UN32 = 56
+    // `group Destination`: the target a shader-blended draw reads.
+    let destinationGroup: UN32 = 1
+    let destinationBinding: UN32 = 0
+}
+
+// RB::Shader::blend's codes for the modes this port blends in the shader.
+namespace ShaderBlends {
+    let ported: [Number] = [25, 32, 43, 44, 51, 52, 53]
+}
+
+// What a draw binds as `group Destination`. RenderBox reads the destination
+// in the fragment; WebGPU cannot, so a draw that does is given the target as
+// it stood before it (see `renderContents`).
+enum DestinationSlot {
+    // The draw's pipeline has no destination group.
+    Absent
+    // The pipeline has one the draw does not read: the white texel is bound.
+    Unused
+    // The draw reads the target as it stands when it is drawn.
+    Wanted
+    Read(BindGroup)
+}
+
+namespace Surfaces {
+    // What a layer, a clip's coverage and the target start as.
+    let transparent: RGBAColor = RGBAColor { r: 0, g: 0, b: 0, a: 0 }
+    // A clip mask before any clip narrows it.
+    let unclipped: RGBAColor = RGBAColor { r: 1, g: 1, b: 1, a: 1 }
+    // The texel bound where a draw samples no texture.
+    let whitePixel: [UN8] = [255, 255, 255, 255]
+}
+
+// One draw ready to encode: its pipeline and its bound globals and textures.
+struct RecordedDraw {
+    let pipeline: RenderPipeline
+    let bindGroup: BindGroup
+    let vertexCount: UN32
+    var destination: DestinationSlot = .Absent
+}
+
+// What a render keeps while it draws: the device, the target's size, the
+// primitive shader and its pipelines, and every resource made on the way,
+// released when the render ends.
+class RenderSession {
+    var device: GraphicsHeadless
+    // The target's size, or a layer's drawn smaller than it while it draws.
+    var width: UN32
+    var height: UN32
+    // The target's format, which every layer and filter surface takes too.
+    let format: TextureFormat
+    let shader: GraphicsShader
+    let white: GraphicsTexture
+    let sampler: GraphicsSampler
+    // What reads an accumulator: one texel per pixel, unblended.
+    let nearest: GraphicsSampler
+    // RenderBox's dither noise, and the sampler that tiles it.
+    let noise: GraphicsTexture
+    let tiling: GraphicsSampler
+    // `group Destination` with the white texel, for draws that read none.
+    let noDestination: BindGroup
+    // RB::Shader::Tables, which colour filters read.
+    let transfer: GraphicsBuffer
+    // The pass's colour space, RB::ColorSpace's byte: colours in another are
+    // converted into it.
+    let colorSpace: Number
+    var pipelines: [(BlendMode, RenderPipeline)] = []
+    // Each shader function's pipeline, by name, and the shaders compiled for
+    // them.
+    var functionPipelines: [(String, RenderPipeline)] = []
+    var shaders: [GraphicsShader] = []
+    // The textures made from pixels.
+    var textures: [GraphicsTexture] = []
+    // The surfaces passes still use, in the order they were lent, and the
+    // ones a later pass may take.
+    var lent: [PooledSurface] = []
+    var idle: [PooledSurface] = []
+    var uniforms: [GraphicsUniform] = []
+    var buffers: [GraphicsBuffer] = []
+    var bindGroups: [BindGroup] = []
+    // Whether closing the session closes the device and the shared
+    // resources, or leaves them to the RenderDevice it was opened on.
+    var ownsDevice: Bool = true
+}
+
+extend RenderSession {
+    function size() -> Size {
+        return Size { width: width, height: height }
+    }
+
+    function wholeTarget() -> Rect {
+        return Rect { width: width, height: height }
+    }
+}
+
+// Draws `contents` over `clear` into a `width` by `height` target on the GPU
+// and reads every row back: red, green, blue and alpha bytes, premultiplied,
+// top row first.
+public function renderLayer(
+    contents: borrow LayerContents,
+    width: UN32,
+    height: UN32,
+    clear: borrow RGBAColor
+) -> Result<[UN8], RenderFailure> {
+    return renderLayerAs(contents, width, height, clear, .Rgba8, .StandardRgb)
+}
+
+// `renderLayer` into a target of `format` whose colours are in
+// `colorSpace`, read back as its texels: a half-float target's channels as
+// little-endian halves. A device target works in RBDrawable's default space.
+public function renderLayerAs(
+    contents: borrow LayerContents,
+    width: UN32,
+    height: UN32,
+    clear: borrow RGBAColor,
+    format: PixelFormat,
+    colorSpace: ColorSpace
+) -> Result<[UN8], RenderFailure> {
+    let space = workingSpace(colorSpace, format)
+    var session = match openSession(width, height, textureFormat(format), space) {
+        Ok(session) -> session
+        Error(failure) -> return .Error(failure)
+    }
+    let pixels = renderedPixels(session, contents, clear)
+    closeSession(session)
+    return pixels
+}
+
+function renderedPixels(
+    session: borrow mut RenderSession,
+    contents: borrow LayerContents,
+    clear: borrow RGBAColor
+) -> Result<[UN8], RenderFailure> {
+    let target = match surface(session, "renderbox-target") {
+        Ok(target) -> target
+        Error(failure) -> return .Error(failure)
+    }
+    match renderContents(session, contents, target, clear, .None) {
+        Ok -> {}
+        Error(failure) -> return .Error(failure)
+    }
+    return match readTextureRows(session.device.graphics(), target, 0, session.height) {
+        Ok(bytes) -> .Ok(bytes)
+        Error(failure) -> .Error(.Readback(failure))
+    }
+}
+
+function openSession(
+    width: UN32,
+    height: UN32,
+    format: TextureFormat,
+    colorSpace: Number
+) -> Result<RenderSession, RenderFailure> {
+    var device = match openHeadlessGraphicsWithBackend(.Dawn) {
+        Ok(device) -> device
+        Error(failure) -> return .Error(.Device(failure))
+    }
+    let resources = match sessionResources(device.graphics()) {
+        Ok(resources) -> resources
+        Error(failure) -> {
+            device.close()
+            return .Error(.Resource(failure))
+        }
+    }
+    return .Ok(
+        RenderSession {
+            device: device,
+            width: width,
+            height: height,
+            format: format,
+            colorSpace: colorSpace,
+            shader: resources.shader,
+            white: resources.white,
+            sampler: resources.sampler,
+            nearest: resources.nearest,
+            noise: resources.noise,
+            tiling: resources.tiling,
+            noDestination: resources.noDestination,
+            transfer: resources.transfer
+        }
+    )
+}
+
+// What every render shares: the primitive shader, the white texel, the
+// sampler every draw binds, the one accumulators are read with and the
+// gradient dither's noise and its tiling sampler.
+struct SessionResources {
+    let shader: GraphicsShader
+    let white: GraphicsTexture
+    let sampler: GraphicsSampler
+    let nearest: GraphicsSampler
+    let noise: GraphicsTexture
+    let tiling: GraphicsSampler
+    let noDestination: BindGroup
+    let transfer: GraphicsBuffer
+}
+
+// RenderBox's gradient dither noise as a texture.
+function noiseTexture(graphics: borrow Graphics) -> Result<GraphicsTexture, ResourceFailure> {
+    let descriptor = TextureDescriptor {
+        label: "renderbox-noise",
+        width: GradientNoise.side,
+        height: GradientNoise.side
+    }
+    return graphics.createTextureFromPixels(descriptor, GradientNoise.texels)
+}
+
+function sessionResources(graphics: borrow Graphics) -> Result<SessionResources, ResourceFailure> {
+    let shader = try graphics.createShaderFromKslArtifact(
+        "renderbox-primitive",
+        ksl!("Shaders/Primitive.ksl")
+    )
+    let white = try graphics.createTextureFromPixels(
+        TextureDescriptor { label: "renderbox-white", width: 1, height: 1 },
+        Surfaces.whitePixel
+    )
+    let linear = SamplerDescriptor {
+        label: "renderbox-linear",
+        minFilter: .Linear,
+        magFilter: .Linear
+    }
+    let sampler = try graphics.createSampler(linear)
+    let nearest = try graphics.createSampler(SamplerDescriptor { label: "renderbox-nearest" })
+    let noise = try noiseTexture(graphics)
+    let tiling = try graphics.createSampler(
+        SamplerDescriptor {
+            label: "renderbox-tiling",
+            addressModeU: .Repeat,
+            addressModeV: .Repeat
+        }
+    )
+    let noDestination = try graphics.createBindGroup(destinationBindings(white))
+    let transfer = try graphics.createStorageBufferWords("renderbox-transfer", transferTableWords())
+    return .Ok(
+        SessionResources {
+            shader: shader,
+            white: white,
+            sampler: sampler,
+            nearest: nearest,
+            noise: noise,
+            tiling: tiling,
+            noDestination: noDestination,
+            transfer: transfer
+        }
+    )
+}
+
+function closeSession(session: borrow mut RenderSession) {
+    releaseSessionResources(session)
+    if !session.ownsDevice {
+        return
+    }
+    let graphics = session.device.graphics()
+    graphics.destroyBindGroup(session.noDestination)
+    graphics.destroyBuffer(session.transfer)
+    graphics.destroyShader(copy session.shader)
+    graphics.destroyTexture(session.white)
+    graphics.destroySampler(session.sampler)
+    graphics.destroySampler(session.nearest)
+    graphics.destroyTexture(session.noise)
+    graphics.destroySampler(session.tiling)
+    session.device.close()
+}
+
+// What the session made while it drew: surfaces, uniforms, buffers, bind
+// groups, pipelines and the shaders of its filters.
+function releaseSessionResources(session: borrow mut RenderSession) {
+    releasePooledSurfaces(session)
+    let graphics = session.device.graphics()
+    for bindGroup in session.bindGroups {
+        graphics.destroyBindGroup(bindGroup)
+    }
+    for buffer in session.buffers {
+        graphics.destroyBuffer(buffer)
+    }
+    for uniform in session.uniforms {
+        graphics.destroyUniform(uniform)
+    }
+    for texture in session.textures {
+        graphics.destroyTexture(texture)
+    }
+    for shader in session.shaders {
+        graphics.destroyShader(copy shader)
+    }
+    for (blend, pipeline) in session.pipelines {
+        graphics.destroyRenderPipeline(pipeline)
+    }
+    for (name, pipeline) in session.functionPipelines {
+        graphics.destroyRenderPipeline(pipeline)
+    }
+}
+
+// A target-sized texture to draw into and sample from, named `label` for
+// GPU captures.
+function surface(
+    session: borrow mut RenderSession,
+    label: String
+) -> Result<GraphicsTexture, RenderFailure> {
+    var descriptor = surfaceDescriptor(session, Number(session.width), Number(session.height))
+    descriptor.label = label
+    return pooledSurface(session, move descriptor)
+}
+
+// A surface of the session's format at a size of its own: a filter's pass
+// at a lower resolution than the target.
+function sizedSurface(
+    session: borrow mut RenderSession,
+    width: Number,
+    height: Number
+) -> Result<GraphicsTexture, RenderFailure> {
+    return pooledSurface(session, surfaceDescriptor(session, width, height))
+}
+
+// A surface of the session's format to draw into and sample from.
+function surfaceDescriptor(
+    session: borrow RenderSession,
+    width: Number,
+    height: Number
+) -> TextureDescriptor {
+    return TextureDescriptor {
+        label: "renderbox-surface",
+        width: UN32(width),
+        height: UN32(height),
+        format: session.format,
+        usage: .RenderTargetSampled
+    }
+}
+
+// How a pass starts on its target: cleared, or from what earlier passes
+// drew, when one pass's draws are split over several.
+enum PassStart {
+    Cleared(RGBAColor)
+    Loaded
+}
+
+// One pass over `target` cleared to `clear`, with `draws` in order.
+function drawPass(
+    session: borrow mut RenderSession,
+    target: borrow GraphicsTexture,
+    clear: borrow RGBAColor,
+    draws: borrow [RecordedDraw]
+) -> Result<Void, RenderFailure> {
+    return drawPassFrom(session, target, .Cleared(copy clear), draws)
+}
+
+// One pass over `target` started as `start`, with `draws` in order.
+function drawPassFrom(
+    session: borrow mut RenderSession,
+    target: borrow GraphicsTexture,
+    start: borrow PassStart,
+    draws: borrow [RecordedDraw]
+) -> Result<Void, RenderFailure> {
+    var frame = match session.device.frame() {
+        Ok(frame) -> frame
+        Error(failure) -> return .Error(.Device(failure))
+    }
+    let encoder = frame.beginRenderPass(startedRenderPass(target, start))
+    for draw in draws {
+        encoder.setPipeline(draw.pipeline)
+        encoder.setBindGroup(PrimitiveDrawing.group, draw.bindGroup)
+        match draw.destination {
+            Absent -> {}
+            Unused -> encoder.setBindGroup(PrimitiveDrawing.destinationGroup, session.noDestination)
+            Wanted -> encoder.setBindGroup(PrimitiveDrawing.destinationGroup, session.noDestination)
+            Read(group) -> encoder.setBindGroup(PrimitiveDrawing.destinationGroup, group)
+        }
+        encoder.draw(draw.vertexCount)
+    }
+    frame.endPass()
+    session.device.submit()
+    return .Ok
+}
+
+function startedRenderPass(
+    target: borrow GraphicsTexture,
+    start: borrow PassStart
+) -> RenderPassDescriptor {
+    return match start {
+        Cleared(clear) -> clearTextureRenderPass(target, clear)
+        Loaded -> loadedRenderPass(target)
+    }
+}
+
+// A pass over `target` that keeps what is in it.
+function loadedRenderPass(target: borrow GraphicsTexture) -> RenderPassDescriptor {
+    var descriptor = clearTextureRenderPass(target, Surfaces.transparent)
+    descriptor.primaryColorAttachment.loadAction = .Load
+    return descriptor
+}
+
+function destinationBindings(texture: borrow GraphicsTexture) -> BindGroupDescriptor {
+    return BindGroupDescriptor {
+        label: "renderbox-destination",
+        textureEntries: [
+            TextureBindEntry {
+                textureSlot: PrimitiveDrawing.destinationBinding,
+                texture: copy texture
+            }
+        ]
+    }
+}

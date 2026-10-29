@@ -1,0 +1,77 @@
+import Foundation
+
+// RB::Fill::MeshGradient::Type, in its order.
+public enum MeshGradientKind: UN8 {
+    VertexGrid = 1
+    BezierGrid = 2
+    CoonsPatches = 3
+    TensorPatches = 4
+    TriangleGrid = 5
+    Triangles = 6
+}
+
+// RB::Fill::MeshGradient. `positions` holds every element's points and
+// `colors` its colours, as `points_per_elt` and `colors_per_elt` count them:
+// a grid point is one point, or five for a bezier grid's position and its
+// left, top, right and bottom controls; a Coons patch is twelve points round
+// its edge, a tensor patch sixteen, a triangle three. `width` is a grid's
+// points per row. Where no patch or triangle draws, `background` does.
+public struct MeshGradient {
+    let kind: MeshGradientKind
+    let width: Number
+    let positions: [Point]
+    let colors: [RGBAColor]
+    let background: RGBAColor
+    let colorSpace: ColorSpace
+    // The low nibble of the mesh's flags.
+    let interpolation: ColorInterpolation
+    // Colour runs along cubics across a grid's cells instead of bilinearly.
+    let smooth: Bool
+    // The fill's transform, applied before the shape's.
+    var transform: AffineTransform = AffineTransform()
+}
+
+namespace MeshElements {
+    // points_per_elt and colors_per_elt, by kind.
+    let points: [Number] = [0, 1, 5, 12, 16, 1, 3]
+    let colors: [Number] = [0, 1, 1, 4, 4, 1, 3]
+    // valid_config's most cells of a grid, and of a triangle grid.
+    let gridCells: Number = 0x4000
+    let triangleGridCells: Number = 0x10000
+    // Its most patches and triangles.
+    let patches: Number = 0x4000
+    let triangles: Number = 0x5555
+}
+
+extend MeshGradient {
+    // The mesh's elements: a grid's points, or its patches or triangles.
+    function count() -> Number {
+        let index = Number(code(kind))
+        let perElement = MeshElements.points[index]
+        let fromColors = trunc(colors.count / MeshElements.colors[index])
+        return min(trunc(positions.count / perElement), fromColors)
+    }
+
+    // A grid's rows.
+    function height() -> Number {
+        return width > 0 ? trunc(count() / width) : 0
+    }
+
+    // valid_config: a mesh it refuses draws only its background.
+    function valid() -> Bool {
+        let elements = count()
+        return match kind {
+            VertexGrid, BezierGrid -> validGrid(elements, MeshElements.gridCells)
+            TriangleGrid -> validGrid(elements, MeshElements.triangleGridCells)
+            CoonsPatches, TensorPatches -> elements > 0 && elements <= MeshElements.patches
+            Triangles -> elements > 0 && elements <= MeshElements.triangles
+        }
+    }
+
+    function validGrid(elements: Number, cells: Number) -> Bool {
+        if elements <= 3 || width <= 1 || elements % width != 0 {
+            return false
+        }
+        return (width - 1) * (trunc(elements / width) - 1) < cells
+    }
+}

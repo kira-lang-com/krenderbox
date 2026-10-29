@@ -1,0 +1,114 @@
+import Foundation
+
+public enum FillRule {
+    NonZero
+    EvenOdd
+}
+
+public struct FilledPath {
+    let path: Path
+    let transform: AffineTransform
+}
+
+public struct StrokeStyle {
+    let lineWidth: Number
+    let lineCap: LineCap
+    let lineJoin: LineJoin
+    let miterLimit: Number
+}
+
+public struct StrokedPath {
+    let path: Path
+    let transform: AffineTransform
+    let style: StrokeStyle
+}
+
+// RBShapeData: what a shape covers.
+public enum ShapeData {
+    Primitive(Primitive)
+    FilledPath(FilledPath)
+    StrokedPath(StrokedPath)
+}
+
+// RBShape: the coverage a draw or a clip uses. Setting a geometry replaces
+// the previous one and keeps the fill rule and rendering mode.
+public class Shape {
+    var data: ShapeData = .Primitive(Primitive())
+    var fillRule: FillRule = .NonZero
+    var renderingMode: RenderingMode = .Antialiased
+    var renderingModeArgument: Number = 0
+}
+
+extend Shape {
+    function setEmpty() {
+        setPrimitive(Primitive())
+    }
+
+    function setInfinite() {
+        setPrimitive(Primitive { kind: .Infinite })
+    }
+
+    function setRect(rect: Rect) {
+        setPrimitive(Primitive { kind: .Rect, rect: rect })
+    }
+
+    function setStrokedRect(rect: Rect, lineWidth: Number) {
+        setPrimitive(Primitive { kind: .Rect, rect: rect, lineWidth: lineWidth })
+    }
+
+    function setRoundedRect(rect: Rect, cornerRadius: Number, cornerStyle: RoundedCornerStyle) {
+        let corner = Size { width: cornerRadius, height: cornerRadius }
+        setPrimitive(roundedPrimitive(rect, corner, cornerStyle, 0))
+    }
+
+    function setRoundedRect(rect: Rect, cornerSize: Size, cornerStyle: RoundedCornerStyle) {
+        setPrimitive(roundedPrimitive(rect, cornerSize, cornerStyle, 0))
+    }
+
+    function setStrokedRoundedRect(
+        rect: Rect,
+        cornerRadius: Number,
+        cornerStyle: RoundedCornerStyle,
+        lineWidth: Number
+    ) {
+        let corner = Size { width: cornerRadius, height: cornerRadius }
+        setPrimitive(roundedPrimitive(rect, corner, cornerStyle, lineWidth))
+    }
+
+    function setEllipse(rect: Rect) {
+        let corner = Size { width: rect.width / 2, height: rect.height / 2 }
+        setPrimitive(roundedPrimitive(rect, corner, .Circular, 0))
+    }
+
+    function setCircle(center: Point, radius: Number) {
+        let diameter = radius * 2
+        setEllipse(
+            Rect { x: center.x - radius, y: center.y - radius, width: diameter, height: diameter }
+        )
+    }
+
+    function setPath(path: Path, transform: AffineTransform) {
+        data = .FilledPath(FilledPath { path: path, transform: transform })
+    }
+
+    function setStrokedPath(path: Path, transform: AffineTransform, style: StrokeStyle) {
+        data = .StrokedPath(StrokedPath { path: path, transform: transform, style: style })
+    }
+
+    function setRenderingMode(mode: RenderingMode, argument: Number) {
+        renderingMode = mode
+        renderingModeArgument = argument
+    }
+
+    // -setEOFill:: whether the even-odd rule decides what a path covers.
+    function setEvenOddFill(evenOdd: Bool) {
+        fillRule = evenOdd ? .EvenOdd : .NonZero
+    }
+
+    function setPrimitive(primitive: Primitive) {
+        var shaped = copy primitive
+        shaped.renderingMode = renderingMode
+        shaped.renderingModeArgument = renderingModeArgument
+        data = .Primitive(shaped)
+    }
+}

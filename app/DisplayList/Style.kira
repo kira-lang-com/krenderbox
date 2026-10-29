@@ -1,0 +1,210 @@
+import Foundation
+
+// RB::DisplayList::ShadowFlag: bit 0 draws the shadow above what casts it,
+// bit 1 the shadow alone, bit 2 shadows the alpha outside it, bit 3 keeps
+// both out of a layer of their own, bit 4 dithers the blur and bit 5 knocks
+// what casts it out of the shadow.
+public distinct ShadowFlags = UN8
+
+public namespace ShadowFlags {
+    let none: ShadowFlags = ShadowFlags(0)
+    let above: ShadowFlags = ShadowFlags(1)
+    let only: ShadowFlags = ShadowFlags(2)
+    let inverseAlpha: ShadowFlags = ShadowFlags(4)
+    let layer: ShadowFlags = ShadowFlags(8)
+    let dither: ShadowFlags = ShadowFlags(16)
+    let knockout: ShadowFlags = ShadowFlags(32)
+}
+
+extend ShadowFlags {
+    function has(flag: ShadowFlags) -> Bool {
+        return (raw & flag.raw) == flag.raw
+    }
+}
+
+// RB::DisplayList::ShadowStyle: what an item casts, blurred by `radius`,
+// moved by `offset` and painted `color`, its alpha reaching half at
+// `midpoint` of the blur. The radius and offset are in the space of
+// `transform`, the state's when the shadow was added.
+public struct ShadowStyle {
+    let radius: Number
+    let midpoint: Number
+    let offset: Size
+    let color: RGBAColor
+    let colorSpace: ColorSpace
+    let headroom: Number
+    let blendMode: BlendMode
+    let flags: ShadowFlags
+    let transform: AffineTransform
+}
+
+// RBColorFilterFlags: the space a colour filter's matrix works in, and
+// whether it takes premultiplied colours.
+public distinct ColorFilterFlags = UN8
+
+public namespace ColorFilterFlags {
+    let none: ColorFilterFlags = ColorFilterFlags(0)
+    let linear: ColorFilterFlags = ColorFilterFlags(1)
+    let nonLinear: ColorFilterFlags = ColorFilterFlags(2)
+    let premultiplied: ColorFilterFlags = ColorFilterFlags(4)
+}
+
+extend ColorFilterFlags {
+    function has(flag: ColorFilterFlags) -> Bool {
+        return (raw & flag.raw) == flag.raw
+    }
+}
+
+// RB::DisplayList::ColorMatrixStyle: a 4 by 5 matrix, row by row, each
+// output channel the inputs' sum by its row plus the row's last entry.
+public struct ColorMatrixStyle {
+    let matrix: [Number]
+    let flags: ColorFilterFlags
+}
+
+// RB::Filter::ColorClamp: each colour channel kept between `min` and
+// `max`, in `colorSpace`'s primaries, or the pass's for Device. Alpha is
+// left as it is.
+public struct ColorClampStyle {
+    let min: RGBAColor
+    let max: RGBAColor
+    let colorSpace: ColorSpace
+}
+
+// RBPixelComponent: the channel a gradient map reads, or the Rec. 709
+// luminance of the colour.
+public enum PixelComponent: UN8 {
+    Red = 0
+    Green = 1
+    Blue = 2
+    Alpha = 3
+    Luminance = 4
+}
+
+// RB::DisplayList::AlphaGradientStyle, the gradient map: every pixel
+// replaced by the colour `gradient` has where `component` falls between
+// `low` and `high`. The gradient's geometry is the alpha gradient's.
+public struct GradientMapStyle {
+    let component: PixelComponent
+    let low: Number
+    let high: Number
+    let gradient: Gradient
+}
+
+// RB::Filter::GaussianBlur's flags: bit 0 makes the result opaque, bits 1
+// and 2 the colour space, bit 3 dithers, bits 4 and 5 the quality, which sets the variance each
+// pass takes, and bit 8 a rectangle the blur is bounded by.
+public distinct BlurFlags = UN16
+
+public namespace BlurFlags {
+    let none: BlurFlags = BlurFlags(0)
+    // The last pass divides each pixel by its alpha, at least 0.005, and
+    // sets alpha to 1.
+    let opaque: BlurFlags = BlurFlags(1)
+}
+
+// RB::Filter::GaussianBlur: a Gaussian whose standard deviation along each
+// axis is `radius`, in device pixels.
+public struct BlurStyle {
+    let radius: Vector2
+    let flags: BlurFlags
+}
+
+// RB::DisplayList::AlphaThresholdStyle, the colour threshold: every pixel
+// replaced by `color` where `component` lies between `low` and `high`,
+// antialiased at both edges; with no `high`, everywhere above `low`.
+public struct AlphaThresholdStyle {
+    let component: PixelComponent
+    let low: Number
+    let high: Number?
+    let color: RGBAColor
+}
+
+// RB::Filter::Distance's format, flag bits 1 to 4: what the filter writes.
+// None is the distance alone, mapped into the range; the gradients write it
+// in red and the edge's unit normal in green and blue, mapped from -1...1 by
+// a half and a half (inverted, the normal flips), or by one and nothing for
+// the float ones.
+public enum DistanceFormat: UN8 {
+    Distance = 0
+    Gradient = 1
+    GradientInverse = 2
+    GradientFloat = 3
+    GradientFloatInverse = 4
+}
+
+// The smoothing level, flag bits 5 to 8, taken when no blur radius is given.
+public enum DistanceSmoothing: UN8 {
+    Default = 0
+    None = 1
+    Low = 2
+    Medium = 3
+    High = 4
+}
+
+// How the filter finds the content's edge, flag bits 9 to 12. Exact reads
+// the antialiased alpha as it is; inexact and threshold redraw it as a
+// threshold at a half first; alpha-is-distance takes alpha for the distance
+// already and only smooths it.
+public enum DistanceEdgeDetection: UN8 {
+    Default = 0
+    Exact = 1
+    Inexact = 2
+    Threshold = 3
+    AlphaIsDistance = 4
+}
+
+// RB::Filter::Distance, the distance transform: every pixel's distance to the
+// content's edge, mapped to nothing `outside` pixels outside the edge and to
+// one `inside` pixels outside it (negative: inside), then smoothed by a
+// Gaussian of `smoothingRadius`, or the level's when that is negative.
+// Lengths are in device pixels.
+public struct DistanceStyle {
+    let outside: Number
+    let inside: Number
+    let scale: Number
+    let smoothingRadius: Number
+    let format: DistanceFormat
+    let smoothing: DistanceSmoothing
+    let edges: DistanceEdgeDetection
+}
+
+// RBShaderFilterFlags: the kind of filter in bits 0 to 3 (layer 0, colour
+// 1, warp 2), then the colour space, dithering, alpha only, the secondary
+// layer's bounds and mipmapping.
+public distinct ShaderFilterFlags = UN32
+
+public namespace ShaderFilterFlags {
+    let layer: ShaderFilterFlags = ShaderFilterFlags(0)
+    let kindMask: UN32 = 0xf
+}
+
+// How far a filter's output may reach past its layer: RenderBox's border of
+// infinities, which leaves it unbounded, or a distance each way.
+public enum FilterBorder {
+    Unbounded
+    Bounded(Vector2)
+}
+
+// RB::CustomEffect from add_shader_filter: the shader run at every pixel's
+// point in user space, its first argument after the point the layer, read
+// at any point; `border` is how far its output may reach past the layer, and
+// `transform` the state's when it was added.
+public struct ShaderFilterStyle {
+    let shader: Shader
+    let border: FilterBorder
+    let flags: ShaderFilterFlags
+    let transform: AffineTransform
+}
+
+// A style the state applies to everything drawn under it.
+public enum Style {
+    Shadow(ShadowStyle)
+    ColorMatrix(ColorMatrixStyle)
+    ColorClamp(ColorClampStyle)
+    GradientMap(GradientMapStyle)
+    Distance(DistanceStyle)
+    ShaderFilter(ShaderFilterStyle)
+    AlphaThreshold(AlphaThresholdStyle)
+    Blur(BlurStyle)
+}

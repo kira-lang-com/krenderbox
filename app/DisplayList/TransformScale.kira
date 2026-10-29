@@ -1,0 +1,38 @@
+import Foundation
+
+extend AffineTransform {
+    // RB::AffineTransform::scale: how much the transform scales a length. A
+    // uniform scale or a quarter turn of one gives its size; otherwise the
+    // mean of the two axes' scales, one where both are one.
+    function lengthScale() -> Number {
+        if a == d && b == 0 && c == 0 {
+            return abs(a)
+        }
+        if d == 0 && a == 0 && b == c {
+            return abs(b)
+        }
+        let xSquared = a * a + b * b
+        let ySquared = c * c + d * d
+        if xSquared == 1 && ySquared == 1 {
+            return 1
+        }
+        return (sqrt(xSquared) + sqrt(ySquared)) * 0.5
+    }
+
+    // RB::AffineTransform::scale2: how much the transform scales a length
+    // along each axis, as `lengthScale` decides its fast paths.
+    function axisScales() -> (Number, Number) {
+        if a == d && b == 0 && c == 0 {
+            return (abs(a), abs(a))
+        }
+        if d == 0 && a == 0 && b == c {
+            return (abs(b), abs(b))
+        }
+        let xSquared = a * a + b * b
+        let ySquared = c * c + d * d
+        if xSquared == 1 && ySquared == 1 {
+            return (1, 1)
+        }
+        return (sqrt(xSquared), sqrt(ySquared))
+    }
+}

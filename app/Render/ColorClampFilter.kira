@@ -1,0 +1,74 @@
+import Foundation
+import Ember
+
+// RB::Filter::ColorClamp::render: the colour, unpremultiplied and decoded
+// when the pass is encoded, carried into the clamp's primaries scaled so
+// [min, max] is [0, 1], clamped by form 7, then carried back and scaled out
+// again at `opacity`. Alpha is not touched.
+function colorClampFiltered(
+    session: borrow mut RenderSession,
+    source: GraphicsTexture,
+    style: borrow ColorClampStyle,
+    opacity: Number
+) -> Result<(GraphicsTexture, Number), RenderFailure> {
+    let halves = try clampHalves(session.colorSpace, style, opacity)
+    let encodedPass = session.colorSpace > 0xf
+    let setup = FilterColorSetup {
+        mode: FilterColorForms.clampedMatrices,
+        halves: halves,
+        linear: encodedPass,
+        unpremultiplyOuter: !encodedPass
+    }
+    let target = try filterColorPass(session, move source, setup)
+    return .Ok((target, 1))
+}
+
+// ColorGlobals for form 7: the matrix into the clamp's primaries with each
+// row over (max - min), the offset -min over (max - min), and the matrix
+// back with each row times (max - min) and the opacity.
+function clampHalves(
+    pass: Number,
+    style: borrow ColorClampStyle,
+    opacity: Number
+) -> Result<[Number], RenderFailure> {
+    let space = match spaceCode(style.colorSpace) {
+        Some(code) -> code
+        None -> pass
+    }
+    var low = copy style.min
+    var high = copy style.max
+    if space > 0xf {
+        let decoding = try colorConversion(space, 0, space & 0xf, 0)
+        low = decoding.converted(low)
+        high = decoding.converted(high)
+    }
+    let primaries = space & 0xf
+    let range = [high.r - low.r, high.g - low.g, high.b - low.b]
+    let reciprocal = [1 / range[0], 1 / range[1], 1 / range[2]]
+    let scales = [range[0] * opacity, range[1] * opacity, range[2] * opacity]
+    var halves = rowsScaled(primariesMatrix(pass & 0xf, primaries), reciprocal)
+    halves.appendAll([-low.r * reciprocal[0], -low.g * reciprocal[1], -low.b * reciprocal[2]])
+    halves.appendAll(rowsScaled(primariesMatrix(primaries, pass & 0xf), scales))
+    var rounded: [Number] = []
+    for value in halves {
+        rounded.append(halfRounded(value))
+    }
+    return .Ok(rounded)
+}
+
+// RB::ColorSpace::Matrix(from, to), column by column.
+function primariesMatrix(from: Number, to: Number) -> [Number] {
+    return match conversionMatrix(from, to) {
+        Some(columns) -> columns
+        None -> [1, 0, 0, 0, 1, 0, 0, 0, 1]
+    }
+}
+
+// Each row r of a column-major 3x3 matrix times factors[r].
+function rowsScaled(columns: borrow [Number], factors: borrow [Number]) -> [Number] {
+    var result: [Number] = []
+    for index in 0..9 {
+        result.append(columns[index] * factors[index % 3])
+    }
+    return result
+}

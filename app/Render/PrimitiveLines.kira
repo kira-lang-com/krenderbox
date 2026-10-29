@@ -1,0 +1,98 @@
+import Foundation
+
+// set_globals for a line: its rect holds the start and the vector to the
+// end. The line is drawn as the rect it covers in a space turned onto it,
+// x along the line from its start: a butt line's rect ends at its ends, a
+// square line's reaches a half width past them, and a round line's is
+// rounded by its half width. A line thinner than a device pixel is drawn a
+// pixel wide at the alpha its width covers.
+namespace PrimitiveLine {
+    // A line shorter than this has no direction: only a round one, a dot,
+    // draws.
+    let shortest: Number = 0.00001
+}
+
+function lined(
+    primitive: borrow Primitive,
+    space: borrow PrimitiveSpace,
+    discards: Bool
+) -> Result<PrimitiveDraw, PrimitiveFailure> {
+    let length = sqrt(
+        primitive.rect.width * primitive.rect.width + primitive.rect.height * primitive.rect.height
+    )
+    let round = primitive.kind == .RoundLine
+    if length <= PrimitiveLine.shortest && !round {
+        return discards ? .Ok(.Nothing) : covering(.Empty, space)
+    }
+    let start = space.transform.applying(Point { x: primitive.rect.x, y: primitive.rect.y })
+    var along = copy space.transform
+    along.tx = start.x
+    along.ty = start.y
+    if length > PrimitiveLine.shortest {
+        along = turnedOnto(
+            move along,
+            primitive.rect.width / length,
+            primitive.rect.height / length
+        )
+    }
+    let (half, alpha) = lineHalfWidth(primitive.lineWidth, space.scale)
+    let shape = lineShape(primitive, length, half)
+    let turned = PrimitiveSpace { transform: along, scale: space.scale, target: copy space.target }
+    return match shaped(shape, turned, discards) {
+        Ok(draw) -> .Ok(withAlpha(move draw, alpha))
+        Error(failure) -> .Error(failure)
+    }
+}
+
+// The line's half width, at least half a pixel, and the alpha a thinner one
+// draws at instead.
+function lineHalfWidth(width: Number, scale: Number) -> (Number, Number) {
+    let thinnest = PrimitiveThresholds.halfPixel / scale
+    if thinnest <= width / 2 { return (width / 2, 1) }
+    return (thinnest, width * scale)
+}
+
+// The rect, rounded for a round cap, the line `length` long covers once
+// turned onto it from its start: a square or round cap reaches `half` past
+// each end.
+function lineShape(primitive: borrow Primitive, length: Number, half: Number) -> Primitive {
+    let round = primitive.kind == .RoundLine
+    let reach = primitive.kind == .ButtLine ? 0 : half
+    let corner = round ? half : 0
+    return Primitive {
+        kind: round ? .RoundedRect : .Rect,
+        rect: Rect { x: -reach, y: -half, width: length + 2 * reach, height: 2 * half },
+        cornerRadii: CornerRadii {
+            topLeft: corner,
+            topRight: corner,
+            bottomRight: corner,
+            bottomLeft: corner
+        },
+        renderingMode: primitive.renderingMode,
+        renderingModeArgument: primitive.renderingModeArgument,
+        inverted: primitive.inverted,
+        coversByAlpha: primitive.coversByAlpha,
+        blurred: primitive.blurred
+    }
+}
+
+// `transform` after a turn taking x onto the direction (`cosine`, `sine`).
+function turnedOnto(transform: AffineTransform, cosine: Number, sine: Number) -> AffineTransform {
+    return AffineTransform {
+        a: transform.a * cosine + transform.c * sine,
+        b: transform.b * cosine + transform.d * sine,
+        c: transform.c * cosine - transform.a * sine,
+        d: transform.d * cosine - transform.b * sine,
+        tx: transform.tx,
+        ty: transform.ty
+    }
+}
+
+function withAlpha(draw: PrimitiveDraw, alpha: Number) -> PrimitiveDraw {
+    var globals = match draw {
+        Nothing -> return .Nothing
+        Quad(globals) -> globals
+    }
+    globals.alpha = alpha
+    return .Quad(globals)
+}

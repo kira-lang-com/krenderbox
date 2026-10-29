@@ -1,0 +1,334 @@
+import Foundation
+
+// RB::Stroke::flatten_points and RB::Stroke::Flattener<Point>: a stroked
+// path walked into the lines StrokeLines builds points from. Every point but
+// the last of a curve joins round; the last joins as the stroke does when
+// it is wider than a line's flatness, its miter limited against the next
+// segment's direction. The Flattener also skips segments wholly outside the
+// target's bounds; that only drops what lands off the target, so it is not
+// ported.
+
+namespace StrokeFlattening {
+    // The share of the line width that raises a curve's line count, and the
+    // least it counts as.
+    let widthShare: Number = 0.05
+    // Under this squared length a curve's tangent falls to its next control.
+    let shortTangent: Number = 0.00001
+    // A miter's cosine above this is drawn round.
+    let straight: Number = 0.99
+}
+
+struct StrokeFlattener {
+    var lines: StrokeLines
+    let cap: LineCap
+    let join: Number
+    let miterSquared: Number
+    // RB::Stroke::Flattener's Wang constant, and the half width up to which a
+    // join is drawn round.
+    let tolerance: Number
+    let roundBelow: Number
+    let attributes: StrokeAttributes
+    var pending: Bool = false
+    var pendingJoin: Number = 1
+    var pendingPosition: Point = Point()
+    var atStart: Bool = false
+    var dot: Bool = false
+    var emitted: Bool = false
+    // Whether a tangent is owed, and whether it is the end's.
+    var needsTangent: Bool = true
+    var endTangent: Bool = false
+    var lastDirection: Point = Point()
+    var start: Point = Point()
+    var firstDirection: Point = Point()
+    var current: Point = Point()
+}
+
+// The stroke's points for `path` in stroke space, drawn through `toDevice`.
+function strokeLines(
+    path: borrow Path,
+    toDevice: borrow AffineTransform,
+    style: borrow StrokeStyle
+) -> StrokeLines {
+    let (scaleX, scaleY) = toDevice.axisScales()
+    let lines = StrokeLines {
+        cap: style.lineCap,
+        miterLimit: style.miterLimit,
+        toDevice: copy toDevice,
+        reach: Point { x: scaleX * sqrt(2), y: scaleY * sqrt(2) },
+        shortestCut: 0.01 / toDevice.lengthScale()
+    }
+    let flat = Flattening.flatness / toDevice.lengthScale()
+    var flattener = StrokeFlattener {
+        lines: lines,
+        cap: style.lineCap,
+        join: Number(code(strokeJoin(style))),
+        miterSquared: style.miterLimit * style.miterLimit,
+        tolerance: sqrt(
+            max(style.lineWidth * StrokeFlattening.widthShare, 1) * Flattening.cubicConstant / flat
+        ),
+        roundBelow: flat,
+        attributes: StrokeAttributes { halfWidth: style.lineWidth / 2, alpha: 1 }
+    }
+    for element in path.elements {
+        flattener.walk(copy element)
+    }
+    flattener.endPath()
+    flattener.lines.finishSubpath(false, StrokeJoin.round)
+    return flattener.lines
+}
+
+// -[RBShape _setStrokedRBPath:…]: a miter join without a positive limit is
+// a bevel.
+function strokeJoin(style: borrow StrokeStyle) -> LineJoin {
+    if style.lineJoin == .Miter && !(style.miterLimit > 0) {
+        return .Bevel
+    }
+    return style.lineJoin
+}
+
+extend StrokeFlattener {
+    function walk(borrow mut self, element: PathElement) {
+        match element {
+            MoveTo(point) -> moveTo(move point)
+            LineTo(point) -> lineTo(move point)
+            QuadraticTo(segment) -> quadraticTo(move segment)
+            CubicTo(segment) -> cubicTo(move segment)
+            CloseSubpath -> closePath()
+        }
+    }
+
+    function moveTo(borrow mut self, point: Point) {
+        flushFinal()
+        emitEndTangent()
+        start = copy point
+        firstDirection = Point()
+        current = copy point
+        atStart = true
+        dot = false
+        emitted = false
+        needsTangent = true
+        endTangent = false
+        lines.moveTo(move point, copy attributes)
+    }
+
+    function endPath(borrow mut self) {
+        flushFinal()
+        emitEndTangent()
+    }
+
+    function emitEndTangent(borrow mut self) {
+        if needsTangent && endTangent {
+            lines.tangent(copy lastDirection, true)
+            needsTangent = false
+        }
+    }
+
+    // lineto: a line to where it already is only marks a dot at a round
+    // cap's start.
+    function lineTo(borrow mut self, point: Point) {
+        if samePoint(point, current) {
+            if atStart && cap == .Round {
+                dot = true
+            }
+            return
+        }
+        let direction = minus(point, current)
+        current = copy point
+        atStart = false
+        flush(direction)
+        emitStartTangent(direction)
+        hold(move point, endJoin(), move direction)
+    }
+
+    // The join a segment's last point takes: the stroke's when it is wider
+    // than a line's flatness, otherwise round.
+    function endJoin() -> Number {
+        return roundBelow < attributes.halfWidth ? join : StrokeJoin.round
+    }
+
+    function emitStartTangent(borrow mut self, direction: borrow Point) {
+        if needsTangent && !endTangent {
+            firstDirection = copy direction
+            lines.tangent(copy direction, false)
+            needsTangent = false
+        }
+    }
+
+    // The point waits to be handed on until the next segment's direction
+    // settles its join.
+    function hold(borrow mut self, point: Point, pointJoin: Number, direction: Point) {
+        dot = false
+        pending = true
+        pendingJoin = pointJoin
+        pendingPosition = point
+        needsTangent = true
+        endTangent = true
+        lastDirection = direction
+    }
+
+    // flush_lineto: the waiting point handed on, a miter checked against
+    // the limit going on in `direction`.
+    function flush(borrow mut self, direction: borrow Point) {
+        if !pending {
+            return
+        }
+        var pointJoin = pendingJoin
+        if pointJoin == StrokeJoin.miter {
+            pointJoin = needsTangent && endTangent ? miterJoin(
+                lastDirection,
+                direction,
+                miterSquared
+            ) : StrokeJoin.miter
+        }
+        handOn(pointJoin)
+    }
+
+    function handOn(borrow mut self, pointJoin: Number) {
+        lines.lineTo(copy pendingPosition, copy attributes, pointJoin)
+        pending = false
+        emitted = true
+    }
+
+    // flush_lineto at a subpath's end: a dot drawn, or the waiting point
+    // handed on joining round.
+    function flushFinal(borrow mut self) {
+        if flushEmptyLine() || !pending {
+            return
+        }
+        handOn(StrokeJoin.round)
+    }
+
+    // flush_empty_line: a dot's subpath, one point going right.
+    function flushEmptyLine(borrow mut self) -> Bool {
+        if !(atStart && dot) {
+            return false
+        }
+        lines.tangent(Point { x: 1, y: 0 }, false)
+        lines.lineTo(copy start, copy attributes, StrokeJoin.round)
+        lines.tangent(Point { x: 1, y: 0 }, true)
+        needsTangent = false
+        dot = false
+        emitted = true
+        return true
+    }
+
+    // closepath: a line back to the start, its point joining the first
+    // segment, and the start joined by the stroke's join, limited.
+    function closePath(borrow mut self) {
+        let before = copy current
+        lineTo(copy start)
+        flush(firstDirection)
+        var closing = StrokeJoin.round
+        if emitted {
+            closing = pendingJoin
+            if closing == StrokeJoin.miter {
+                var arriving = minus(start, before)
+                if arriving.x == 0 && arriving.y == 0 {
+                    arriving = copy lastDirection
+                }
+                closing = miterJoin(arriving, firstDirection, miterSquared)
+            }
+        }
+        lines.closePath(closing)
+    }
+}
+
+// apply_miter_limit: a miter whose corner reaches past the limit is a bevel,
+// and a nearly straight one is round.
+function miterJoin(from: borrow Point, to: borrow Point, limitSquared: Number) -> Number {
+    let a = normalized(from)
+    let b = normalized(to)
+    let cosine = a.x * b.x + a.y * b.y
+    if cosine > StrokeFlattening.straight {
+        return StrokeJoin.round
+    }
+    return (cosine + 1) * limitSquared >= 2 ? StrokeJoin.miter : StrokeJoin.bevel
+}
+
+extend StrokeFlattener {
+    // quadto: the quadratic raised to a cubic.
+    function quadraticTo(borrow mut self, segment: QuadraticSegment) {
+        let control = segment.control
+        let end = segment.end
+        cubicTo(
+            CubicSegment {
+                firstControl: Point {
+                    x: (current.x + 2 * control.x) / 3,
+                    y: (current.y + 2 * control.y) / 3
+                },
+                secondControl: Point {
+                    x: (end.x + 2 * control.x) / 3,
+                    y: (end.y + 2 * control.y) / 3
+                },
+                end: copy end
+            }
+        )
+    }
+
+    // cubeto: the curve as Wang's count of lines, its inner points joining
+    // round, its tangents falling to the next control where one is too
+    // short.
+    function cubicTo(borrow mut self, segment: CubicSegment) {
+        let from = copy current
+        let one = segment.firstControl
+        let two = segment.secondControl
+        let end = segment.end
+        if samePoint(from, one) && samePoint(one, two) && samePoint(two, end) {
+            lineTo(copy end)
+            return
+        }
+        let leaving = curveTangent(minus(one, from), minus(two, from), minus(end, from))
+        let arriving = curveTangent(minus(end, two), minus(end, one), minus(end, from))
+        current = copy end
+        atStart = false
+        flush(leaving)
+        // Rounded up, as the Adaptor's cubeto does (frintp).
+        let count = ceil(tolerance * sqrt(cubicDifference(from, segment)))
+        if count < 1 && samePoint(from, end) {
+            return
+        }
+        let lines = min(count, Flattening.maximumLines)
+        for step in 1..max(lines, 1) {
+            passOn(leaving)
+            pendingJoin = StrokeJoin.round
+            pending = true
+            dot = false
+            pendingPosition = cubicPoint(from, segment, step / lines)
+        }
+        passOn(leaving)
+        hold(copy end, endJoin(), move arriving)
+    }
+
+    // The waiting point handed on with the join it has, then the start
+    // tangent when one is owed.
+    function passOn(borrow mut self, leaving: borrow Point) {
+        if pending {
+            handOn(pendingJoin)
+        }
+        emitStartTangent(leaving)
+    }
+}
+
+// The first of three candidate tangents long enough to keep.
+function curveTangent(first: Point, second: Point, third: Point) -> Point {
+    if first.x * first.x + first.y * first.y >= StrokeFlattening.shortTangent {
+        return first
+    }
+    if second.x * second.x + second.y * second.y >= StrokeFlattening.shortTangent {
+        return second
+    }
+    return third
+}
+
+// The cubic from `from` through `segment` at `t`.
+function cubicPoint(from: borrow Point, segment: borrow CubicSegment, t: Number) -> Point {
+    let u = 1 - t
+    let a = u * u * u
+    let b = 3 * u * u * t
+    let c = 3 * u * t * t
+    let d = t * t * t
+    return Point {
+        x: a * from.x + b * segment.firstControl.x + c * segment.secondControl.x + d * segment.end.x,
+        y: a * from.y + b * segment.firstControl.y + c * segment.secondControl.y + d * segment.end.y
+    }
+}

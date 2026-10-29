@@ -1,0 +1,206 @@
+import Foundation
+
+// RB::Path::Flattener and RB::Path::Accumulator: a path walked in device
+// space into the segment buffer `Shaders/PathExterior.ksl` reads.
+//
+// Every segment reaches the accumulator as a cubic with the number of lines
+// it is drawn as: a line is a cubic with its controls at its thirds and one
+// line, a quadratic is raised to a cubic and keeps its own count. The
+// Flattener also crops every segment to the target's bounds; that only drops
+// what lands off the target, so it is not ported.
+
+namespace Flattening {
+    // RB::bezier_flatness: how far, in device pixels, a line may stray from
+    // the curve it stands for. The distance rendering modes halve it.
+    let flatness: Number = 0.25
+    // Wang's formula for a cubic's lines is sqrt(cubicConstant / flatness)
+    // times the root of its second difference; a quadratic's constant is
+    // quadraticConstant.
+    let cubicConstant: Number = 0.75
+    let quadraticConstant: Number = 0.5
+    // The most lines one segment is drawn as.
+    let maximumLines: Number = 1024
+    // What RenderBox stores where a subpath breaks: positive infinity's bits.
+    let breakBits: UN32 = 0x7f800000
+}
+
+// One segment as the accumulator takes it: a cubic from `start` drawn as
+// `lines` lines.
+struct FlattenedCubic {
+    let start: Point
+    let firstControl: Point
+    let secondControl: Point
+    let end: Point
+    let lines: Number
+}
+
+// RB::Path::Buffer: the words of the segment buffer, whether it holds points
+// or cubic records, how many edges the exterior draw covers and the device
+// bounds of every point stored.
+struct SegmentBuffer {
+    let words: [UN32]
+    let lines: Bool
+    let edges: Number
+    let bounds: Rect
+}
+
+// What a walk keeps between elements: the subpath's start, the current
+// point and the segments so far.
+struct Flattener {
+    var start: Point = Point()
+    var current: Point = Point()
+    var segments: [FlattenedCubic] = []
+    var lineConstant: Number = 0
+    var quadraticConstant: Number = 0
+}
+
+function flatness(mode: RenderingMode) -> Number {
+    return match mode {
+        Antialiased -> Flattening.flatness
+        Aliased -> Flattening.flatness
+        InnerDistance -> Flattening.flatness / 2
+        OuterDistance -> Flattening.flatness / 2
+        SignedDistance -> Flattening.flatness / 2
+    }
+}
+
+// `path` in device space as the accumulator's segments, every subpath
+// closed, as RB::Path::Flattener's moveto and endpath close the one before.
+function flattened(path: borrow Path, toDevice: borrow AffineTransform, mode: RenderingMode) -> [
+    FlattenedCubic
+] {
+    let tolerance = flatness(mode)
+    var flattener = Flattener {
+        lineConstant: sqrt(Flattening.cubicConstant / tolerance),
+        quadraticConstant: sqrt(Flattening.quadraticConstant / tolerance)
+    }
+    for element in path.elements {
+        flattener.walk(element.transformed(toDevice))
+    }
+    flattener.close()
+    return flattener.segments
+}
+
+extend Flattener {
+    function walk(borrow mut self, element: PathElement) {
+        match element {
+            MoveTo(point) -> {
+                close()
+                start = copy point
+                current = move point
+            }
+            LineTo(point) -> line(move point)
+            QuadraticTo(segment) -> quadratic(move segment)
+            CubicTo(segment) -> cubic(move segment)
+            CloseSubpath -> close()
+        }
+    }
+
+    // closepath: a line back to the start when the subpath is not there.
+    function close(borrow mut self) {
+        line(copy start)
+    }
+
+    // lineto skips a line to where it already is.
+    function line(borrow mut self, to: Point) {
+        if samePoint(current, to) {
+            return
+        }
+        segments.append(lineCubic(current, to))
+        current = to
+    }
+
+    // quadto: the quadratic raised to a cubic, as
+    // FlattenedConsumer::push_back does, with the quadratic's own count.
+    function quadratic(borrow mut self, segment: QuadraticSegment) {
+        let control = segment.control
+        let end = segment.end
+        let difference = Point {
+            x: current.x - 2 * control.x + end.x,
+            y: current.y - 2 * control.y + end.y
+        }
+        let count = lineCount(quadraticConstant, length(difference), current, end)
+        if count > 0 {
+            let first = Point {
+                x: (current.x + 2 * control.x) / 3,
+                y: (current.y + 2 * control.y) / 3
+            }
+            let second = Point { x: (end.x + 2 * control.x) / 3, y: (end.y + 2 * control.y) / 3 }
+            segments.append(
+                FlattenedCubic {
+                    start: copy current,
+                    firstControl: first,
+                    secondControl: second,
+                    end: copy end,
+                    lines: count
+                }
+            )
+        }
+        current = end
+    }
+
+    function cubic(borrow mut self, segment: CubicSegment) {
+        let count = lineCount(lineConstant, cubicDifference(current, segment), current, segment.end)
+        if count > 0 {
+            segments.append(
+                FlattenedCubic {
+                    start: copy current,
+                    firstControl: copy segment.firstControl,
+                    secondControl: copy segment.secondControl,
+                    end: copy segment.end,
+                    lines: count
+                }
+            )
+        }
+        current = copy segment.end
+    }
+}
+
+// RB::CubicIterator::segment_count: the larger of the cubic's two second
+// differences, by components, and its length.
+function cubicDifference(start: borrow Point, segment: borrow CubicSegment) -> Number {
+    let one = segment.firstControl
+    let two = segment.secondControl
+    let early = Point { x: abs(start.x - 2 * one.x + two.x), y: abs(start.y - 2 * one.y + two.y) }
+    let late = Point {
+        x: abs(one.x - 2 * two.x + segment.end.x),
+        y: abs(one.y - 2 * two.y + segment.end.y)
+    }
+    return length(Point { x: max(early.x, late.x), y: max(early.y, late.y) })
+}
+
+// Wang's formula: the root of the difference's length times the constant,
+// rounded up (the Flattener's frintp). Under one line a segment is a line
+// when it goes anywhere and nothing when it ends where it starts.
+function lineCount(
+    constant: Number,
+    difference: Number,
+    from: borrow Point,
+    to: borrow Point
+) -> Number {
+    let count = ceil(sqrt(difference) * constant)
+    if count < 1 {
+        return samePoint(from, to) ? 0 : 1
+    }
+    return min(count, Flattening.maximumLines)
+}
+
+function lineCubic(from: borrow Point, to: borrow Point) -> FlattenedCubic {
+    let dx = to.x - from.x
+    let dy = to.y - from.y
+    return FlattenedCubic {
+        start: copy from,
+        firstControl: Point { x: from.x + dx / 3, y: from.y + dy / 3 },
+        secondControl: Point { x: from.x + dx * 2 / 3, y: from.y + dy * 2 / 3 },
+        end: copy to,
+        lines: 1
+    }
+}
+
+function samePoint(a: borrow Point, b: borrow Point) -> Bool {
+    return a.x == b.x && a.y == b.y
+}
+
+function length(vector: borrow Point) -> Number {
+    return sqrt(vector.x * vector.x + vector.y * vector.y)
+}

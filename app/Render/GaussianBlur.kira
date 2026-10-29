@@ -1,0 +1,263 @@
+import Foundation
+import Ember
+
+namespace GaussianBlurDrawing {
+    let pipeline: String = "renderbox-blur"
+    // GaussianBlur::render: a deviation under this on both axes draws the
+    // layer as it is.
+    let smallestRadius: Number = 0.25
+    // The variance one round of passes is planned to take, at the default
+    // quality, and the most rounds.
+    let roundVariance: Number = 27.5625
+    let mostRounds: Number = 32
+    // BlurRenderer::render: seven rounds or more quarter the layer first,
+    // three or more halve it, and each loses this much variance to the
+    // downsample's own blur.
+    let quarterRounds: Number = 7
+    let halfRounds: Number = 3
+    let quarterLoss: Number = 0.47265625
+    let halfLoss: Number = 0.765625
+    // The quarter downsample's four reads, each the average of four pixels.
+    let boxTaps: [Number] = [-1, 1, 1, 1, -1, -1, 1, -1]
+    let boxWeight: Number = 0.25
+}
+
+// BlurRenderer's state: the variance left on each axis, the rounds planned,
+// the layer's size and bounds at the current resolution, and the scale from
+// the target's pixels to it.
+struct BlurState {
+    var varianceX: Number
+    var varianceY: Number
+    var rounds: Number
+    var width: Number
+    var height: Number
+    var low: Vector2
+    var high: Vector2
+    var scale: Number = 1
+}
+
+// GaussianBlur::render then BlurRenderer::render: downsampled while many
+// rounds are planned, blurred across then down for each round left, and
+// drawn back up to the target's size.
+function gaussianBlurred(
+    session: borrow mut RenderSession,
+    source: GraphicsTexture,
+    style: borrow BlurStyle,
+    opacity: Number
+) -> Result<(GraphicsTexture, Number), RenderFailure> {
+    // Colour spaces, dithering, the other qualities and a bounding
+    // rectangle are not ported.
+    let opaque = style.flags.raw == BlurFlags.opaque.raw
+    if style.flags.raw != BlurFlags.none.raw && !opaque {
+        return .Error(.UnportedStyle)
+    }
+    let smallest = GaussianBlurDrawing.smallestRadius
+    if style.radius.x < smallest && style.radius.y < smallest {
+        return .Ok((source, opacity))
+    }
+    var state = blurState(session, style)
+    return .Ok((try blurSteps(session, source, state, opaque), opacity))
+}
+
+// `source` downsampled, blurred round by round and drawn back up. Each
+// step's surface goes back to the session once the next has read it.
+function blurSteps(
+    session: borrow mut RenderSession,
+    source: borrow GraphicsTexture,
+    state: borrow mut BlurState,
+    opaque: Bool
+) -> Result<GraphicsTexture, RenderFailure> {
+    var current = copy source
+    while state.rounds >= GaussianBlurDrawing.halfRounds {
+        let next = try downsampled(session, current, state)
+        returnStep(session, current, source)
+        current = next
+    }
+    while state.rounds > 0 {
+        let next = try narrowRound(session, current, state, opaque)
+        returnStep(session, current, source)
+        current = next
+    }
+    if state.scale != 1 {
+        let next = try upsampled(session, current, state)
+        returnStep(session, current, source)
+        current = next
+    }
+    return .Ok(current)
+}
+
+function blurState(session: borrow RenderSession, style: borrow BlurStyle) -> BlurState {
+    let width = Number(session.width)
+    let height = Number(session.height)
+    let varianceX = style.radius.x * style.radius.x
+    let varianceY = style.radius.y * style.radius.y
+    return BlurState {
+        varianceX: varianceX,
+        varianceY: varianceY,
+        rounds: blurRounds(varianceX, varianceY),
+        width: width,
+        height: height,
+        low: Vector2 { x: 0, y: 0 },
+        high: Vector2 { x: width, y: height }
+    }
+}
+
+// The rounds the larger variance needs, at most 27.5625 each, from 1 to 32.
+function blurRounds(varianceX: Number, varianceY: Number) -> Number {
+    let rounds = trunc(max(varianceX, varianceY) / GaussianBlurDrawing.roundVariance - 0.001)
+    return clamp(rounds, 1, GaussianBlurDrawing.mostRounds)
+}
+
+// One downsample: to a quarter by four reads of four pixels each, or to a
+// half by one read between four. The variance the downsample blurs by is
+// taken off, and the rounds planned again.
+function downsampled(
+    session: borrow mut RenderSession,
+    source: borrow GraphicsTexture,
+    state: borrow mut BlurState
+) -> Result<GraphicsTexture, RenderFailure> {
+    let quarter = state.rounds >= GaussianBlurDrawing.quarterRounds
+    let factor = quarter ? 0.25 : 0.5
+    let step = 1 / factor
+    var floats = blurBounds(state, step)
+    if quarter {
+        floats.appendAll(GaussianBlurDrawing.boxTaps)
+        floats.appendAll([0, 0, 0, 0, 0, 0, 0, 0])
+        let weight = GaussianBlurDrawing.boxWeight
+        floats.appendAll([weight, weight, weight, weight, 0, 0, 0, 0])
+    } else {
+        floats.appendAll(noTaps())
+    }
+    floats.appendAll([0, quarter ? BlurModes.box : BlurModes.single])
+    floats.appendAll([1 / state.width, 1 / state.height])
+    let loss = quarter ? GaussianBlurDrawing.quarterLoss : GaussianBlurDrawing.halfLoss
+    state.varianceX = state.varianceX * factor * factor - loss
+    state.varianceY = state.varianceY * factor * factor - loss
+    state.width = trunc(state.width * factor)
+    state.height = trunc(state.height * factor)
+    state.low = Vector2 { x: trunc(state.low.x * factor), y: trunc(state.low.y * factor) }
+    state.high = Vector2 { x: trunc(state.high.x * factor), y: trunc(state.high.y * factor) }
+    state.scale = state.scale * factor
+    state.rounds = blurRounds(state.varianceX, state.varianceY)
+    let target = try sizedSurface(session, state.width, state.height)
+    try blurDraw(session, source, target, move floats, GaussianBlurDrawing.pipeline, session.format)
+    return .Ok(target)
+}
+
+// One round: across, then down, each by the axis's variance over the
+// rounds still planned. RenderBox divides the whole variance again each
+// round rather than what is left of it. An opaque blur's last pass, down
+// in the last round, makes its result opaque.
+function narrowRound(
+    session: borrow mut RenderSession,
+    source: borrow GraphicsTexture,
+    state: borrow mut BlurState,
+    opaque: Bool
+) -> Result<GraphicsTexture, RenderFailure> {
+    let across = narrowBlurKernel((max(state.varianceX, 0) - 0.001) / state.rounds)
+    let down = narrowBlurKernel((max(state.varianceY, 0) - 0.001) / state.rounds)
+    let target = try sizedSurface(session, state.width, state.height)
+    let name = GaussianBlurDrawing.pipeline
+    let format = session.format
+    try blurDraw(session, source, target, narrowFloats(state, across, true), copy name, format)
+    let result = try sizedSurface(session, state.width, state.height)
+    var downFloats = narrowFloats(state, down, false)
+    downFloats.appendAll([opaque && state.rounds == 1 ? 1 : 0, 0])
+    try blurDraw(session, target, result, move downFloats, move name, format)
+    returnSurface(session, target)
+    state.rounds -= 1
+    return .Ok(result)
+}
+
+// The last pass: one read of the downsampled layer where each target pixel
+// falls in it.
+function upsampled(
+    session: borrow mut RenderSession,
+    source: borrow GraphicsTexture,
+    state: borrow BlurState
+) -> Result<GraphicsTexture, RenderFailure> {
+    var floats = blurBounds(state, state.scale)
+    floats.appendAll(noTaps())
+    floats.appendAll([0, BlurModes.single])
+    floats.appendAll([1 / state.width, 1 / state.height])
+    let target = try surface(session, "renderbox-blur-upsampled")
+    try blurDraw(session, source, target, move floats, GaussianBlurDrawing.pipeline, session.format)
+    return .Ok(target)
+}
+
+// BlurGlobals' map from the target's pixel, times `scale`, and the source's
+// bounds half a pixel inside its edge.
+function blurBounds(state: borrow BlurState, scale: Number) -> [Number] {
+    return [
+        scale, scale, 0, 0,
+        state.low.x + 0.5, state.low.y + 0.5, state.high.x - 0.5, state.high.y - 0.5
+    ]
+}
+
+function noTaps() -> [Number] {
+    var floats: [Number] = []
+    for _ in 0..24 {
+        floats.append(0)
+    }
+    return floats
+}
+
+function narrowFloats(
+    state: borrow BlurState,
+    kernel: borrow NarrowBlurKernel,
+    across: Bool
+) -> [Number] {
+    var floats = blurBounds(state, 1)
+    for offset in kernel.offsets {
+        floats.append(across ? offset : 0)
+        floats.append(across ? 0 : offset)
+    }
+    for weight in kernel.weights {
+        floats.append(weight)
+    }
+    floats.appendAll([kernel.pairsRead, BlurModes.narrow])
+    floats.appendAll([1 / state.width, 1 / state.height])
+    return floats
+}
+
+// One filter_blur draw over `target`, reading `source` with the linear
+// sampler, by the pipeline `name` writing `format`.
+function blurDraw(
+    session: borrow mut RenderSession,
+    source: borrow GraphicsTexture,
+    target: borrow GraphicsTexture,
+    floats: [Number],
+    name: String,
+    format: TextureFormat
+) -> Result<Void, RenderFailure> {
+    let pipeline = try namedPipeline(
+        session,
+        move name,
+        ksl!("Shaders/Blur.ksl"),
+        ColorTargetDescriptor { format: format, blend: BlendState { enabled: false } }
+    )
+    // Every pass but an opaque blur's last leaves the flags 0.
+    var globals = floats
+    while globals.count < Number(NarrowBlurDrawing.globalsFloatCount) { globals.append(0) }
+    let uniform = try sessionUniform(
+        session,
+        "renderbox-blur-globals",
+        NarrowBlurDrawing.globalsFloatCount,
+        move globals
+    )
+    let graphics = session.device.graphics()
+    let bindGroup = match graphics.beginBindGroup("renderbox-blur") {
+        Ok(bindGroup) -> bindGroup
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    graphics.bindGroupAddUniform(bindGroup, NarrowBlurDrawing.globalsBinding, uniform)
+    graphics.bindGroupAddTexture(bindGroup, NarrowBlurDrawing.sourceBinding, source)
+    graphics.bindGroupAddSampler(bindGroup, NarrowBlurDrawing.samplerBinding, session.sampler)
+    session.bindGroups.append(copy bindGroup)
+    let draw = RecordedDraw {
+        pipeline: pipeline,
+        bindGroup: bindGroup,
+        vertexCount: NarrowBlurDrawing.vertexCount
+    }
+    return drawPass(session, target, Surfaces.transparent, [draw])
+}

@@ -1,0 +1,99 @@
+import Foundation
+
+// RB::Coverage::StrokeablePath::simplify: a stroke RenderBox draws as a
+// primitive instead. A stroke with no width covers nothing; a path that is
+// one straight line, under a transform that only scales it evenly (or
+// swaps its axes), stroked with a plain cap, is a line primitive from its
+// start to its end. Rects, ellipses and rounded rects simplify only when
+// their CGPath was made as one, which a Path never is.
+namespace StrokeSimplifying {
+    // A line reaching further than this from the origin stays a stroke.
+    let farthest: Number = 32767
+}
+
+// The shape `data` draws in `mode`, a stroke simplified where RenderBox
+// simplifies it.
+function simplifiedShape(data: ShapeData, mode: RenderingMode) -> ShapeData {
+    let stroked = match data {
+        StrokedPath(stroked) -> stroked
+        Primitive(primitive) -> return .Primitive(primitive)
+        FilledPath(filled) -> return .FilledPath(filled)
+    }
+    return match strokePrimitive(stroked, mode) {
+        Some(primitive) -> .Primitive(primitive)
+        None -> .StrokedPath(stroked)
+    }
+}
+
+function strokePrimitive(stroked: borrow StrokedPath, mode: RenderingMode) -> Primitive? {
+    let style = stroked.style
+    if style.lineWidth <= 0 {
+        return .Some(Primitive())
+    }
+    let t = stroked.transform
+    let even = (t.a == t.d && t.b == 0 && t.c == 0) || (t.d == 0 && t.a == 0 && t.b == t.c)
+    if !even {
+        return .None
+    }
+    let (start, end) = try lineOf(stroked.path) otherwise return .None
+    let kind = try lineKind(style.lineCap, mode) otherwise return .None
+    let from = t.applying(start)
+    let to = t.applying(end)
+    let reach = max(max(abs(from.x), abs(from.y)), max(abs(to.x), abs(to.y)))
+    if reach > StrokeSimplifying.farthest {
+        return .None
+    }
+    return .Some(
+        Primitive {
+            kind: kind,
+            rect: Rect { x: from.x, y: from.y, width: to.x - from.x, height: to.y - from.y },
+            lineWidth: style.lineWidth
+        }
+    )
+}
+
+// RBPathApplyShape's line test: one move, then one line; a move before the
+// line starts the line again.
+function lineOf(path: borrow Path) -> (Point, Point)? {
+    var points: [Point] = []
+    for element in path.elements {
+        match element {
+            MoveTo(point) -> {
+                if points.count > 1 {
+                    return .None
+                }
+                points = [point]
+            }
+            LineTo(point) -> {
+                if points.count != 1 {
+                    return .None
+                }
+                points.append(point)
+            }
+            QuadraticTo(segment) -> return .None
+            CubicTo(segment) -> return .None
+            CloseSubpath -> return .None
+        }
+    }
+    if points.count != 2 {
+        return .None
+    }
+    return .Some((copy points[0], copy points[1]))
+}
+
+// The line primitive a cap draws, in a mode a line primitive has.
+function lineKind(cap: LineCap, mode: RenderingMode) -> PrimitiveKind? {
+    let plain = mode == .Antialiased || mode == .Aliased
+    if !plain {
+        return .None
+    }
+    return match cap {
+        Butt -> .Some(.ButtLine)
+        Round -> .Some(.RoundLine)
+        Square -> .Some(.SquareLine)
+        OutwardsTriangle -> .None
+        InwardsTriangle -> .None
+        ForwardsTriangle -> .None
+        BackwardsTriangle -> .None
+    }
+}

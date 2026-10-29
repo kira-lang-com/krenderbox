@@ -1,0 +1,73 @@
+import Foundation
+
+// A triangle mesh's vertex: RB::Shader::MeshGradient::Vertex.
+struct MeshVertex {
+    let point: Point
+    let color: RGBAColor
+}
+
+// The triangles a triangle mesh draws, three vertices each, in the order
+// RenderBox draws them: mesh_gradient_vertex reads vertex `last - vid`.
+function meshTriangles(mesh: borrow MeshGradient, colors: borrow [RGBAColor]) -> [MeshVertex] {
+    return match mesh.kind {
+        TriangleGrid -> stripTriangles(triangleGridStrip(mesh, colors))
+        Triangles -> listTriangles(mesh, colors)
+        VertexGrid, BezierGrid, CoonsPatches, TensorPatches -> []
+    }
+}
+
+// make_triangle_grid: a strip down each pair of rows, joined to the next by
+// repeating the last vertex of one and the first of the other.
+function triangleGridStrip(mesh: borrow MeshGradient, colors: borrow [RGBAColor]) -> [MeshVertex] {
+    let width = mesh.width
+    let rows = mesh.height()
+    var strip: [MeshVertex] = []
+    for y in 0..rows - 1 {
+        for x in 0..width {
+            let top = y * width + x
+            strip.append(MeshVertex { point: copy mesh.positions[top], color: copy colors[top] })
+            if y != 0 && x == 0 {
+                strip.append(
+                    MeshVertex { point: copy mesh.positions[top], color: copy colors[top] }
+                )
+            }
+            let bottom = top + width
+            strip.append(
+                MeshVertex { point: copy mesh.positions[bottom], color: copy colors[bottom] }
+            )
+        }
+        if y != rows - 2 {
+            let repeated = copy strip[strip.count - 1]
+            strip.append(repeated)
+        }
+    }
+    return strip
+}
+
+// The strip drawn from its end, as a list of its triangles.
+function stripTriangles(strip: borrow [MeshVertex]) -> [MeshVertex] {
+    var triangles: [MeshVertex] = []
+    let last = strip.count - 1
+    for first in 0..strip.count - 2 {
+        for corner in 0..3 {
+            triangles.append(copy strip[last - first - corner])
+        }
+    }
+    return triangles
+}
+
+// make_triangles fills three vertices a triangle, but render_mesh_gradient
+// draws only as many vertices as there are triangles, the last ones first:
+// a third of the triangles, those at the end.
+function listTriangles(mesh: borrow MeshGradient, colors: borrow [RGBAColor]) -> [MeshVertex] {
+    let count = mesh.count()
+    let last = count * 3 - 1
+    var triangles: [MeshVertex] = []
+    for vid in 0..trunc(count / 3) * 3 {
+        let index = last - vid
+        triangles.append(
+            MeshVertex { point: copy mesh.positions[index], color: copy colors[index] }
+        )
+    }
+    return triangles
+}

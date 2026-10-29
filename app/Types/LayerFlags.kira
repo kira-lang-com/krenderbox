@@ -1,0 +1,31 @@
+import Foundation
+
+// The flags `beginLayer(flags:)` takes, RenderBox's bits.
+public distinct LayerFlags = UN32
+
+public namespace LayerFlags {
+    let none: LayerFlags = LayerFlags(0)
+    // The layer starts from a copy of what is under it instead of clear.
+    let needsBackground: LayerFlags = LayerFlags(1)
+    let alphaOnly: LayerFlags = LayerFlags(2)
+    let linear: LayerFlags = LayerFlags(4)
+    let nonLinear: LayerFlags = LayerFlags(8)
+    let lowersTransition: LayerFlags = LayerFlags(16)
+    let onlyMetadata: LayerFlags = LayerFlags(32)
+    let toneMapWholeLayer: LayerFlags = LayerFlags(64)
+    let ignoredByNeedsBackground: LayerFlags = LayerFlags(128)
+}
+
+extend LayerFlags {
+    function has(flag: LayerFlags) -> Bool {
+        return (raw & flag.raw) == flag.raw
+    }
+
+    function union(other: LayerFlags) -> LayerFlags {
+        return LayerFlags(raw | other.raw)
+    }
+
+    function without(other: LayerFlags) -> LayerFlags {
+        return LayerFlags(raw ^ (raw & other.raw))
+    }
+}

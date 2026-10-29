@@ -1,0 +1,308 @@
+import Foundation
+
+// RB::Coverage::StrokeablePath::bounds: RB::Stroke::FixedWidthLineBounds
+// walks the path in stroke space. A segment adds nothing itself: every
+// point between two segments adds its join, every open subpath's ends add
+// their caps, and a curve adds its own bounds grown by the half width.
+
+namespace StrokeBounding {
+    // Under this squared length a curve's tangent falls to its next control.
+    let shortTangent: Number = 0.00001
+    // A miter's cosine at or above this, or this close to zero, adds no
+    // corner.
+    let straight: Number = 0.99
+    let square: Number = 0.00001
+}
+
+// RB::Stroke::LineBounds.
+struct LineBounds {
+    let cap: LineCap
+    let join: LineJoin
+    let miterSquared: Number
+    var low: Point = Point()
+    var high: Point = Point()
+    var bounded: Bool = false
+}
+
+struct FixedWidthLineBounds {
+    var bounds: LineBounds
+    let halfWidth: Number
+    var current: Point = Point()
+    var start: Point = Point()
+    var startTangent: Point = Point()
+    var lastDirection: Point = Point()
+    // Whether the subpath has no segment yet.
+    var empty: Bool = true
+}
+
+// The box `stroked` covers in the space its transform maps into, or none
+// when it draws nothing.
+public function strokeBounds(stroked: borrow StrokedPath) -> Rect? {
+    let style = stroked.style
+    var walk = FixedWidthLineBounds {
+        bounds: LineBounds {
+            cap: style.lineCap,
+            join: strokeJoin(style),
+            miterSquared: style.miterLimit * style.miterLimit
+        },
+        halfWidth: style.lineWidth / 2
+    }
+    for element in stroked.path.transformed(stroked.transform).elements {
+        walk.walk(copy element)
+    }
+    walk.endPath()
+    if !walk.bounds.bounded {
+        return .None
+    }
+    let low = walk.bounds.low
+    let high = walk.bounds.high
+    return .Some(Rect { x: low.x, y: low.y, width: high.x - low.x, height: high.y - low.y })
+}
+
+extend LineBounds {
+    // add_point: `point` grown by `extent` along each axis.
+    function addPoint(borrow mut self, point: borrow Point, extent: borrow Point) {
+        include(Point { x: point.x - extent.x, y: point.y - extent.y })
+        include(Point { x: point.x + extent.x, y: point.y + extent.y })
+    }
+
+    function include(borrow mut self, point: borrow Point) {
+        if !bounded {
+            low = copy point
+            high = copy point
+            bounded = true
+            return
+        }
+        low = Point { x: min(low.x, point.x), y: min(low.y, point.y) }
+        high = Point { x: max(high.x, point.x), y: max(high.y, point.y) }
+    }
+
+    // add_cap: an end going `direction` (the start's tangent reversed),
+    // carried out a half width for square caps and the triangles that
+    // point out, its tip added for the ones that come to a point.
+    function addCap(point: borrow Point, halfWidth: Number, tangent: borrow Point, end: Bool) {
+        let going = end ? copy tangent : Point { x: -tangent.x, y: -tangent.y }
+        let direction = normalized(going)
+        let extent = Point { x: abs(direction.y * halfWidth), y: abs(direction.x * halfWidth) }
+        let tip = Point {
+            x: point.x + direction.x * halfWidth,
+            y: point.y + direction.y * halfWidth
+        }
+        match capReach(cap, end) {
+            Round -> addPoint(point, Point { x: halfWidth, y: halfWidth })
+            Flat -> addPoint(point, extent)
+            Square -> addPoint(tip, extent)
+            Tip -> {
+                include(tip)
+                addPoint(point, extent)
+            }
+        }
+    }
+
+    // add_join: a round join's disc; a miter's corner when its limit keeps
+    // it, besides the disc; a bevel's two cut ends.
+    function addJoin(point: borrow Point, halfWidth: Number, from: borrow Point, to: borrow Point) {
+        let disc = Point { x: halfWidth, y: halfWidth }
+        match join {
+            Miter -> {
+                addMiter(point, halfWidth, normalized(from), normalized(to))
+                addPoint(point, disc)
+            }
+            Round -> addPoint(point, disc)
+            Bevel -> {
+                let a = normalized(from)
+                let b = normalized(to)
+                addPoint(point, Point { x: abs(a.y * halfWidth), y: abs(a.x * halfWidth) })
+                addPoint(point, Point { x: abs(b.y * halfWidth), y: abs(b.x * halfWidth) })
+            }
+        }
+    }
+
+    function addMiter(point: borrow Point, halfWidth: Number, a: borrow Point, b: borrow Point) {
+        let cosine = a.x * b.x + a.y * b.y
+        if !(cosine < StrokeBounding.straight && abs(cosine) > StrokeBounding.square) {
+            return
+        }
+        if !(miterSquared * (cosine + 1) >= 2) {
+            return
+        }
+        let reach = halfWidth * sqrt(2) / sqrt(cosine + 1)
+        let bisector = normalized(Point { x: a.x + b.x, y: a.y + b.y })
+        let corner = Point { x: -bisector.y * reach, y: bisector.x * reach }
+        include(Point { x: point.x - corner.x, y: point.y - corner.y })
+        include(Point { x: point.x + corner.x, y: point.y + corner.y })
+    }
+}
+
+// How add_cap reaches past an end for each RB::LineCap; a forwards triangle
+// points out only at the end, a backwards one only at the start.
+enum CapReach {
+    Round
+    Flat
+    Square
+    Tip
+}
+
+function capReach(cap: LineCap, end: Bool) -> CapReach {
+    return match cap {
+        Round -> .Round
+        Square -> .Square
+        Butt -> .Flat
+        OutwardsTriangle -> .Tip
+        InwardsTriangle -> .Square
+        ForwardsTriangle -> end ? .Tip : .Square
+        BackwardsTriangle -> end ? .Square : .Tip
+    }
+}
+
+extend FixedWidthLineBounds {
+    function walk(borrow mut self, element: PathElement) {
+        match element {
+            MoveTo(point) -> moveTo(move point)
+            LineTo(point) -> lineTo(move point)
+            QuadraticTo(segment) -> quadraticTo(move segment)
+            CubicTo(segment) -> cubicTo(move segment)
+            CloseSubpath -> closePath()
+        }
+    }
+
+    function moveTo(borrow mut self, point: Point) {
+        endPath()
+        current = copy point
+        start = point
+    }
+
+    // endpath: an open subpath's two caps.
+    function endPath(borrow mut self) {
+        if empty {
+            return
+        }
+        bounds.addCap(start, halfWidth, startTangent, false)
+        bounds.addCap(current, halfWidth, lastDirection, true)
+        empty = true
+    }
+
+    // The first direction a subpath leaves in, or the join at the pen.
+    function turn(borrow mut self, direction: borrow Point) {
+        if empty {
+            startTangent = copy direction
+            empty = false
+            return
+        }
+        bounds.addJoin(current, halfWidth, lastDirection, direction)
+    }
+
+    function lineTo(borrow mut self, point: Point) {
+        let direction = minus(point, current)
+        turn(direction)
+        current = point
+        lastDirection = direction
+    }
+
+    // closepath: the closing line's join at the pen, then the start joined
+    // to the first segment.
+    function closePath(borrow mut self) {
+        if empty {
+            return
+        }
+        let direction = minus(start, current)
+        bounds.addJoin(current, halfWidth, lastDirection, direction)
+        current = copy start
+        lastDirection = copy direction
+        bounds.addJoin(start, halfWidth, direction, startTangent)
+        empty = true
+    }
+
+    // quadto: the quadratic raised to a cubic.
+    function quadraticTo(borrow mut self, segment: QuadraticSegment) {
+        let control = segment.control
+        let end = segment.end
+        cubicTo(
+            CubicSegment {
+                firstControl: Point {
+                    x: (current.x + 2 * control.x) / 3,
+                    y: (current.y + 2 * control.y) / 3
+                },
+                secondControl: Point {
+                    x: (end.x + 2 * control.x) / 3,
+                    y: (end.y + 2 * control.y) / 3
+                },
+                end: copy end
+            }
+        )
+    }
+
+    // cubeto: the join at the pen, then the curve's bounds grown by the
+    // half width.
+    function cubicTo(borrow mut self, segment: CubicSegment) {
+        let from = copy current
+        let one = segment.firstControl
+        let two = segment.secondControl
+        let end = segment.end
+        let leaving = boundsTangent(minus(one, from), minus(two, from), minus(end, from))
+        let arriving = boundsTangent(minus(end, two), minus(end, one), minus(end, from))
+        turn(leaving)
+        let (low, high) = cubicExtent(from, segment)
+        bounds.include(Point { x: low.x - halfWidth, y: low.y - halfWidth })
+        bounds.include(Point { x: high.x + halfWidth, y: high.y + halfWidth })
+        current = copy end
+        lastDirection = arriving
+    }
+}
+
+// The first of three candidate tangents long enough to keep.
+function boundsTangent(first: Point, second: Point, third: Point) -> Point {
+    if first.x * first.x + first.y * first.y >= StrokeBounding.shortTangent {
+        return first
+    }
+    if second.x * second.x + second.y * second.y >= StrokeBounding.shortTangent {
+        return second
+    }
+    return third
+}
+
+// The box the cubic from `from` through `segment` spans: its ends, and on
+// each axis wherever it turns back between them (RB::Path::cubic_bounds_slow
+// when a control lies outside the ends' box).
+function cubicExtent(from: borrow Point, segment: borrow CubicSegment) -> (Point, Point) {
+    var low = Point { x: min(from.x, segment.end.x), y: min(from.y, segment.end.y) }
+    var high = Point { x: max(from.x, segment.end.x), y: max(from.y, segment.end.y) }
+    let xs = [from.x, segment.firstControl.x, segment.secondControl.x, segment.end.x]
+    let ys = [from.y, segment.firstControl.y, segment.secondControl.y, segment.end.y]
+    var turns = cubicTurns(xs)
+    turns.appendAll(cubicTurns(ys))
+    for t in turns {
+        let point = cubicPoint(from, segment, t)
+        low = Point { x: min(low.x, point.x), y: min(low.y, point.y) }
+        high = Point { x: max(high.x, point.x), y: max(high.y, point.y) }
+    }
+    return (low, high)
+}
+
+// Where strictly between its ends the cubic over `values` has a zero
+// derivative.
+function cubicTurns(values: borrow [Number]) -> [Number] {
+    let a = -values[0] + 3 * values[1] - 3 * values[2] + values[3]
+    let b = 2 * (values[0] - 2 * values[1] + values[2])
+    let c = values[1] - values[0]
+    var roots: [Number] = []
+    if a == 0 {
+        if b != 0 {
+            roots.append(-c / b)
+        }
+    } else {
+        let discriminant = b * b - 4 * a * c
+        if discriminant >= 0 {
+            let root = sqrt(discriminant)
+            roots.append((-b + root) / (2 * a))
+            roots.append((-b - root) / (2 * a))
+        }
+    }
+    var inside: [Number] = []
+    for t in roots {
+        if t > 0 && t < 1 {
+            inside.append(t)
+        }
+    }
+    return inside
+}

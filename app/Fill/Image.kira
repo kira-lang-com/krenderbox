@@ -1,0 +1,48 @@
+import Foundation
+import Ember
+
+// The pixel formats RenderBox renders into and reads images in: four 8-bit
+// channels, or four half floats, each two bytes little-endian.
+public enum PixelFormat {
+    Rgba8
+    Rgba16Float
+}
+
+function textureFormat(format: PixelFormat) -> TextureFormat {
+    return match format {
+        Rgba8 -> .Rgba8Unorm
+        Rgba16Float -> .Rgba16Float
+    }
+}
+
+// Pixels held on the CPU, premultiplied, rows top to bottom.
+public struct Bitmap {
+    let width: UN32
+    let height: UN32
+    let pixels: [UN8]
+    var format: PixelFormat = .Rgba8
+}
+
+// RBImage: what an image fill, an image shader argument or a layer draws
+// from. RenderBox wraps a CGImage, an IOSurface or a Metal texture; here the
+// sources are pixels in memory, uploaded when drawn, and a texture the GPU
+// already has.
+public enum Image {
+    Bitmap(Bitmap)
+    Texture(TextureImage)
+}
+
+// A texture on the GPU, with its size in pixels.
+public struct TextureImage {
+    let texture: GraphicsTexture
+    let width: UN32
+    let height: UN32
+}
+
+// The image's size in pixels.
+function imageSize(image: borrow Image) -> (Number, Number) {
+    return match image {
+        Bitmap(bitmap) -> (Number(bitmap.width), Number(bitmap.height))
+        Texture(texture) -> (Number(texture.width), Number(texture.height))
+    }
+}

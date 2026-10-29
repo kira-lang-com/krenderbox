@@ -1,0 +1,121 @@
+import Foundation
+import Ember
+
+// `group Fill` in `Shaders/Gradient.ksl`, its bindings in order.
+namespace GradientDrawing {
+    let globalsBinding: UN32 = 0
+    let stopsBinding: UN32 = 1
+    let noiseBinding: UN32 = 2
+    let noiseSamplerBinding: UN32 = 3
+    let layerBinding: UN32 = 4
+    let layerSamplerBinding: UN32 = 5
+    let transferBinding: UN32 = 6
+    let globalsFloatCount: UN32 = 32
+    let vertexCount: UN32 = 6
+    let pipeline: String = "renderbox-gradient"
+}
+
+// RB::Fill::Gradient drawn through `transform` at `opacity`, as paint: the
+// gradient's colour at every pixel of a surface the coverage then samples.
+// RenderBox computes it in each coverage fragment; the colour at a pixel is
+// the same.
+function gradientPaint(
+    session: borrow mut RenderSession,
+    gradient: borrow Gradient,
+    transform: borrow AffineTransform,
+    opacity: Number
+) -> Result<Paint, RenderFailure> {
+    let geometry = match gradientGeometry(gradient, transform) {
+        Some(geometry) -> geometry
+        None -> return gradientFallback(gradient)
+    }
+    let colors = try gradientColors(session, gradient, opacity)
+    let floats = gradientFloats(geometry, colors, gradientKind(gradient))
+    let pipeline = try namedPipeline(
+        session,
+        GradientDrawing.pipeline,
+        ksl!("Shaders/Gradient.ksl"),
+        ColorTargetDescriptor { format: .Rgba16Float, blend: BlendState { enabled: false } }
+    )
+    let unread = copy session.noise
+    let bindGroup = try boundGradient(session, move floats, colors.stops, unread)
+    let surface = try floatSurface(session, "renderbox-gradient")
+    let draw = RecordedDraw {
+        pipeline: pipeline,
+        bindGroup: bindGroup,
+        vertexCount: GradientDrawing.vertexCount
+    }
+    return match drawPass(session, surface, Surfaces.transparent, [draw]) {
+        Ok -> .Ok(surfacePaint(session, move surface, 1))
+        Error(failure) -> .Error(failure)
+    }
+}
+
+// Without a geometry: a transform with no inverse paints nothing, and the
+// alpha gradient, not ported, fails.
+function gradientFallback(gradient: borrow Gradient) -> Result<Paint, RenderFailure> {
+    return match gradient.geometry {
+        Axial(axial) -> .Ok(.Solid(Surfaces.transparent))
+        Radial(radial) -> .Ok(.Solid(Surfaces.transparent))
+        Conic(conic) -> .Ok(.Solid(Surfaces.transparent))
+        Alpha -> .Error(.UnportedFill)
+        Angular(angular) -> .Ok(.Solid(Surfaces.transparent))
+    }
+}
+
+// GradientGlobals in `Shaders/Gradient.ksl`'s packing.
+function gradientFloats(
+    geometry: borrow GradientGeometryGlobals,
+    colors: borrow GradientColorGlobals,
+    kind: Number
+) -> [Number] {
+    let map = geometry.toGradient
+    return [
+        map.a, map.b, map.c, map.d,
+        map.tx, map.ty, geometry.first, geometry.second,
+        geometry.swapped ? 1 : 0, kind, Number(code(colors.mode)), colors.smooth ? 1 : 0,
+        colors.first.r, colors.first.g, colors.first.b, colors.first.a,
+        colors.last.r, colors.last.g, colors.last.b, colors.last.a,
+        halfRounded(colors.scale), colors.count, colors.curve ? 1 : 0, 0,
+        0, 0, 0, 0,
+        0, colors.colorOut, colors.table, 0
+    ]
+}
+
+// The gradient's bindings; `layer` is the alpha gradient's source, and any
+// texture where the position comes from the geometry.
+function boundGradient(
+    session: borrow mut RenderSession,
+    floats: [Number],
+    stops: borrow [Number],
+    layer: borrow GraphicsTexture
+) -> Result<BindGroup, RenderFailure> {
+    var words: [UN32] = []
+    for stop in stops { words.append(floatWord(stop)) }
+    // A storage binding cannot be empty; the two-colour mode reads none.
+    if words.count == 0 {
+        words.append(0)
+    }
+    let graphics = session.device.graphics()
+    let buffer = match graphics.createStorageBufferWords("renderbox-gradient-stops", words) {
+        Ok(buffer) -> buffer
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.buffers.append(copy buffer)
+    let globalsLabel = "renderbox-gradient-globals"
+    let count = GradientDrawing.globalsFloatCount
+    let uniform = try sessionUniform(session, move globalsLabel, count, move floats)
+    let bindGroup = match graphics.beginBindGroup("renderbox-gradient") {
+        Ok(bindGroup) -> bindGroup
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    graphics.bindGroupAddUniform(bindGroup, GradientDrawing.globalsBinding, uniform)
+    graphics.bindGroupAddStorageBuffer(bindGroup, GradientDrawing.stopsBinding, buffer)
+    graphics.bindGroupAddTexture(bindGroup, GradientDrawing.noiseBinding, session.noise)
+    graphics.bindGroupAddSampler(bindGroup, GradientDrawing.noiseSamplerBinding, session.tiling)
+    graphics.bindGroupAddTexture(bindGroup, GradientDrawing.layerBinding, layer)
+    graphics.bindGroupAddSampler(bindGroup, GradientDrawing.layerSamplerBinding, session.nearest)
+    graphics.bindGroupAddStorageBuffer(bindGroup, GradientDrawing.transferBinding, session.transfer)
+    session.bindGroups.append(copy bindGroup)
+    return .Ok(bindGroup)
+}

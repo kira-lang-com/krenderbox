@@ -1,0 +1,158 @@
+import Foundation
+import Ember
+
+namespace NarrowBlurDrawing {
+    let pipeline: String = "renderbox-blur-narrow"
+    let globalsFloatCount: UN32 = 40
+    let globalsBinding: UN32 = 0
+    let sourceBinding: UN32 = 1
+    let samplerBinding: UN32 = 2
+    let vertexCount: UN32 = 6
+    // The variance one round of passes takes at most, and what is left that
+    // ends the rounds.
+    let roundVariance: Number = 12.25
+    let settledVariance: Number = 0.01
+    // RB::Filter::NarrowBlurKernel::construct: fifteen pixels a side, read in
+    // eight pairs; a pair under this weight is dropped, and pairs past the
+    // fourth and the sixth need a variance past these.
+    let reach: Number = 15
+    let pairs: Number = 8
+    let smallestWeight: Number = 0.002
+    let fourPairVariance: Number = 12.25
+    let sixPairVariance: Number = 27.5625
+}
+
+// filter_blur's modes: one read, four weighted reads, and the narrow
+// kernel's pairs.
+namespace BlurModes {
+    let single: Number = 0
+    let box: Number = 2
+    let narrow: Number = 4
+}
+
+// A Gaussian of one variance as linear reads either side of the pixel: each
+// pair's offset and weight, and how many pairs the shader reads.
+struct NarrowBlurKernel {
+    var offsets: [Number] = []
+    var weights: [Number] = []
+    var pairsRead: Number = 2
+}
+
+// NarrowBlurKernel::construct(variance).
+function narrowBlurKernel(variance: Number) -> NarrowBlurKernel {
+    let gaussian = gaussianWeights(variance)
+    var kernel = NarrowBlurKernel()
+    var total: Number = 0
+    for pair in 0..NarrowBlurDrawing.pairs {
+        let outer = gaussian[2 * pair + 1]
+        let inner = gaussian[2 * pair]
+        var weight = outer + inner
+        let dropped = (pair > 3 && variance <= NarrowBlurDrawing.fourPairVariance)
+            || (pair > 5 && variance <= NarrowBlurDrawing.sixPairVariance)
+        // A dropped pair's offset is never read. Its weights can both be
+        // zero at a small variance, where the offset would divide by zero.
+        var offset: Number = 0
+        if weight < NarrowBlurDrawing.smallestWeight || dropped {
+            weight = 0
+        } else {
+            offset = outer / weight + 2 * pair
+        }
+        total += weight
+        kernel.weights.append(weight)
+        kernel.offsets.append(offset)
+    }
+    kernel.weights[0] = kernel.weights[0] + 0.5 - total
+    kernel.pairsRead = pairsRead(kernel.weights)
+    return kernel
+}
+
+// e^(-i²/2v) for i from 0 to 15, over their sum both sides, the centre's
+// halved for the pair either side of it.
+function gaussianWeights(variance: Number) -> [Number] {
+    var raw: [Number] = [1]
+    var sum: Number = 1
+    for distance in 1..(NarrowBlurDrawing.reach + 1) {
+        let weight = exp(-(distance * distance) / (variance + variance))
+        raw.append(weight)
+        sum += weight * 2
+    }
+    var weights: [Number] = []
+    for (index, weight) in raw.enumerated() {
+        weights.append(index == 0 ? weight / sum * 0.5 : weight / sum)
+    }
+    return weights
+}
+
+// The kernel's mode, 4 to 7, as filter_blur loops it: 2, 4, 6 or 8 pairs,
+// by whether the third, fifth or seventh is kept.
+function pairsRead(weights: borrow [Number]) -> Number {
+    if weights[6] > 0 {
+        return 8
+    }
+    if weights[4] > 0 {
+        return 6
+    }
+    if weights[2] > 0 {
+        return 4
+    }
+    return 2
+}
+
+// DistanceRenderer's states 7 and 8: rounds of an across pass and a down
+// pass, each blurring by at most 12.25 of `variance`, until it is spent.
+// Each pass's surface goes back to the session once the next has read it;
+// `source` stays the caller's.
+function narrowBlurred(
+    session: borrow mut RenderSession,
+    source: borrow GraphicsTexture,
+    variance: Number
+) -> Result<GraphicsTexture, RenderFailure> {
+    var remaining = variance
+    var current = copy source
+    while remaining > NarrowBlurDrawing.settledVariance {
+        let kernel = narrowBlurKernel(min(remaining, NarrowBlurDrawing.roundVariance))
+        let across = try narrowBlurPass(session, current, kernel, true)
+        returnStep(session, current, source)
+        current = try narrowBlurPass(session, across, kernel, false)
+        returnSurface(session, across)
+        remaining = max(remaining - NarrowBlurDrawing.roundVariance, 0)
+    }
+    return .Ok(current)
+}
+
+function narrowBlurPass(
+    session: borrow mut RenderSession,
+    source: borrow GraphicsTexture,
+    kernel: borrow NarrowBlurKernel,
+    across: Bool
+) -> Result<GraphicsTexture, RenderFailure> {
+    let target = try floatSurface(session, "renderbox-blur-narrow")
+    let floats = narrowBlurFloats(session, kernel, across)
+    try blurDraw(session, source, target, move floats, NarrowBlurDrawing.pipeline, .Rgba16Float)
+    return .Ok(target)
+}
+
+// BlurGlobals: the pixel read where the target is, kept half a pixel inside
+// the edge, each pair's offset along the pass and its weight, how many pairs,
+// and pixels to the sampler's places.
+function narrowBlurFloats(
+    session: borrow RenderSession,
+    kernel: borrow NarrowBlurKernel,
+    across: Bool
+) -> [Number] {
+    let width = Number(session.width)
+    let height = Number(session.height)
+    var floats: [Number] = [1, 1, 0, 0, 0.5, 0.5, width - 0.5, height - 0.5]
+    for offset in kernel.offsets {
+        floats.append(across ? offset : 0)
+        floats.append(across ? 0 : offset)
+    }
+    for weight in kernel.weights {
+        floats.append(weight)
+    }
+    floats.append(kernel.pairsRead)
+    floats.append(BlurModes.narrow)
+    floats.append(1 / width)
+    floats.append(1 / height)
+    return floats
+}

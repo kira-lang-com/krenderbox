@@ -1,0 +1,229 @@
+import Foundation
+import Ember
+
+// RB::render_stroke for lines: draw_stroke draws every segment's coverage,
+// then every miter, bevel and butt cut join's, into the accumulator, keeping
+// the largest a pixel gets (the stroke's
+// coverage blend is RB::BlendMode 15, maximum), then a plane over the
+// stroke's device bounds paints through the coverage as it stands
+// (accumulator_shape's first mode).
+namespace StrokeDrawing {
+    // `group Stroke` in `Shaders/StrokeLines.ksl`, its bindings in order.
+    let group: UN32 = 0
+    let globalsBinding: UN32 = 0
+    let pointsBinding: UN32 = 1
+    let globalsFloatCount: UN32 = 12
+    // A segment's six list vertices, and the points it reads besides its
+    // own two.
+    let segmentVertices: Number = 6
+    let neighbours: Number = 3
+    // A join's two points besides its own.
+    let joinNeighbours: Number = 2
+    let linesPipeline: String = "renderbox-stroke-lines"
+    let joinsPipeline: String = "renderbox-stroke-joins"
+}
+
+// `stroked`'s coverage under `paint` through `mask`, as a draw for the pass
+// the item is in. The coverage pass runs now, before that pass.
+function strokeDraw(
+    session: borrow mut RenderSession,
+    stroked: borrow StrokedPath,
+    item: borrow ShapeItem,
+    paint: Paint,
+    mask: GraphicsTexture?
+) -> Result<RecordedDraw?, RenderFailure> {
+    // A stroke's coverage is aliased only in the aliased mode; RenderBox
+    // draws one in a distance mode as it draws an antialiased one.
+    let aliased = item.shape.renderingMode == .Aliased
+    let toDevice = item.state.transform
+    let lines = strokeLines(stroked.path.transformed(stroked.transform), toDevice, stroked.style)
+    if lines.points.count <= StrokeDrawing.neighbours || !lines.bounded {
+        return .Ok(.None)
+    }
+    let globals = strokeGlobals(session, toDevice, stroked.style, aliased, lines.varyingAlpha)
+    let coverage = match strokeCoverage(session, lines, move globals) {
+        Ok(coverage) -> coverage
+        Error(failure) -> return .Error(failure)
+    }
+    let bounds = Rect {
+        x: lines.low.x,
+        y: lines.low.y,
+        width: lines.high.x - lines.low.x,
+        height: lines.high.y - lines.low.y
+    }
+    let plane = AccumulatorGlobals { plane: planeRect(bounds), rawCoverage: true }
+    return accumulatorDraw(
+        session,
+        move plane,
+        move coverage,
+        move paint,
+        move mask,
+        item.blendMode
+    )
+}
+
+// StrokeGlobals: stroke space to clip space, a device pixel's reach in
+// stroke space, and the stroke's cap, joins, aliasing and alpha.
+function strokeGlobals(
+    session: borrow RenderSession,
+    toDevice: borrow AffineTransform,
+    style: borrow StrokeStyle,
+    aliased: Bool,
+    varyingAlpha: Bool
+) -> [Number] {
+    let width = Number(session.width)
+    let height = Number(session.height)
+    let largest = max(max(abs(toDevice.a), abs(toDevice.b)), max(abs(toDevice.c), abs(toDevice.d)))
+    return [
+        toDevice.a * 2 / width, -toDevice.b * 2 / height,
+        toDevice.c * 2 / width, -toDevice.d * 2 / height,
+        toDevice.tx * 2 / width - 1, 1 - toDevice.ty * 2 / height,
+        0, 1 / largest,
+        Number(code(style.lineCap)), Number(code(strokeJoin(style))),
+        aliased ? 1 : 0, varyingAlpha ? 1 : 0
+    ]
+}
+
+// A target-sized accumulator holding the largest coverage any of `lines`'
+// segments, or any of their miter, bevel and butt cut joins, gives each
+// pixel.
+function strokeCoverage(
+    session: borrow mut RenderSession,
+    lines: borrow StrokeLines,
+    globals: [Number]
+) -> Result<GraphicsTexture, RenderFailure> {
+    let coverage = match floatSurface(session, "renderbox-stroke-coverage") {
+        Ok(coverage) -> coverage
+        Error(failure) -> return .Error(failure)
+    }
+    let buffers = match strokeBuffers(session, lines, move globals) {
+        Ok(buffers) -> buffers
+        Error(failure) -> return .Error(failure)
+    }
+    let draws = match strokeDraws(session, lines, buffers) {
+        Ok(draws) -> draws
+        Error(failure) -> return .Error(failure)
+    }
+    return match drawPass(session, coverage, Surfaces.transparent, draws) {
+        Ok -> .Ok(coverage)
+        Error(failure) -> .Error(failure)
+    }
+}
+
+// The lines pass's draw, then the joins pass's when the stroke has joins.
+function strokeDraws(
+    session: borrow mut RenderSession,
+    lines: borrow StrokeLines,
+    buffers: borrow StrokeBuffers
+) -> Result<[RecordedDraw], RenderFailure> {
+    var draws: [RecordedDraw] = []
+    let segments = lines.points.count - StrokeDrawing.neighbours
+    let source = ksl!("Shaders/StrokeLines.ksl")
+    let linesDraw = try strokePassDraw(
+        session,
+        buffers,
+        StrokeDrawing.linesPipeline,
+        move source,
+        segments
+    )
+    draws.append(linesDraw)
+    if !lines.hasJoins { return .Ok(draws) }
+    let joins = lines.points.count - StrokeDrawing.joinNeighbours
+    let joinsSource = ksl!("Shaders/StrokeJoins.ksl")
+    let joinsDraw = try strokePassDraw(
+        session,
+        buffers,
+        StrokeDrawing.joinsPipeline,
+        move joinsSource,
+        joins
+    )
+    draws.append(joinsDraw)
+    return .Ok(draws)
+}
+
+// The globals and the point buffer both stroke passes read.
+struct StrokeBuffers {
+    let globals: GraphicsUniform
+    let points: GraphicsBuffer
+}
+
+function strokeBuffers(
+    session: borrow mut RenderSession,
+    lines: borrow StrokeLines,
+    globals: [Number]
+) -> Result<StrokeBuffers, RenderFailure> {
+    let graphics = session.device.graphics()
+    let points = match graphics.createStorageBufferWords(
+        "renderbox-stroke-points",
+        pointWords(lines)
+    ) {
+        Ok(points) -> points
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.buffers.append(copy points)
+    let uniform = match sessionUniform(
+        session,
+        "renderbox-stroke-globals",
+        StrokeDrawing.globalsFloatCount,
+        move globals
+    ) {
+        Ok(uniform) -> uniform
+        Error(failure) -> return .Error(failure)
+    }
+    return .Ok(StrokeBuffers { globals: uniform, points: move points })
+}
+
+// One stroke pass's draw: `count` instances of six list vertices through
+// `source`, keeping the largest coverage.
+function strokePassDraw(
+    session: borrow mut RenderSession,
+    buffers: borrow StrokeBuffers,
+    name: String,
+    source: KslArtifact,
+    count: Number
+) -> Result<RecordedDraw, RenderFailure> {
+    let pipeline = match namedPipeline(
+        session,
+        copy name,
+        source,
+        ColorTargetDescriptor {
+            format: .Rgba16Float,
+            blend: BlendState { enabled: true, custom: .Some(blendOperation(.Max)) }
+        }
+    ) {
+        Ok(pipeline) -> pipeline
+        Error(failure) -> return .Error(failure)
+    }
+    let graphics = session.device.graphics()
+    let bindGroup = match graphics.beginBindGroup(name) {
+        Ok(bindGroup) -> bindGroup
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    graphics.bindGroupAddUniform(bindGroup, StrokeDrawing.globalsBinding, buffers.globals)
+    graphics.bindGroupAddStorageBuffer(bindGroup, StrokeDrawing.pointsBinding, buffers.points)
+    session.bindGroups.append(copy bindGroup)
+    return .Ok(
+        RecordedDraw {
+            pipeline: pipeline,
+            bindGroup: bindGroup,
+            vertexCount: UN32(count * StrokeDrawing.segmentVertices)
+        }
+    )
+}
+
+// Each point as the shader's two float4s: position, half width and alpha,
+// then the flags.
+function pointWords(lines: borrow StrokeLines) -> [UN32] {
+    var words: [UN32] = []
+    for point in lines.points {
+        let values = [
+            point.position.x, point.position.y,
+            point.attributes.halfWidth, point.attributes.alpha,
+            point.flags, 0, 0, 0
+        ]
+        for value in values {
+            words.append(floatWord(value))
+        }
+    }
+    return words
+}

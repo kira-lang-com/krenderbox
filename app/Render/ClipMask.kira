@@ -1,0 +1,86 @@
+import Foundation
+import Ember
+
+namespace ClipPaint {
+    // A shape clip's coverage, drawn opaque so its alpha is the coverage.
+    let coverage: RGBAColor = RGBAColor { r: 1, g: 1, b: 1, a: 1 }
+}
+
+// The state's clips as one mask: each clip's coverage drawn into a surface of
+// its own at the clip's alpha, then multiplied into the mask, or its inverse
+// for an inverse clip. Nothing when there are no clips.
+function clipMask(
+    session: borrow mut RenderSession,
+    clips: borrow [Clip]
+) -> Result<GraphicsTexture?, RenderFailure> {
+    if clips.count == 0 {
+        return .Ok(.None)
+    }
+    let mask = match surface(session, "renderbox-clip-mask") {
+        Ok(mask) -> mask
+        Error(failure) -> return .Error(failure)
+    }
+    let mark = lentMark(session)
+    var draws: [RecordedDraw] = []
+    for clip in clips {
+        let recorded = match clipDraw(session, clip) {
+            Ok(recorded) -> recorded
+            Error(failure) -> return .Error(failure)
+        }
+        appendDraw(draws, move recorded)
+    }
+    try drawPass(session, mask, Surfaces.unclipped, draws)
+    // Each clip's coverage is in the mask now.
+    returnSurfaces(session, mark, lentMark(session), [])
+    return .Ok(.Some(mask))
+}
+
+// One clip's coverage, as a draw narrowing the mask.
+function clipDraw(
+    session: borrow mut RenderSession,
+    clip: borrow Clip
+) -> Result<RecordedDraw?, RenderFailure> {
+    let (coverage, alpha, mode) = match clip {
+        Shape(shape) -> (shapeCoverage(session, shape), shape.alpha, shape.mode)
+        Layer(layer) -> (renderedSurface(session, layer.contents, .None), layer.alpha, layer.mode)
+    }
+    let texture = match coverage {
+        Ok(texture) -> texture
+        Error(failure) -> return .Error(failure)
+    }
+    let narrowing: BlendMode = match mode {
+        Normal -> .DestinationIn
+        Inverse -> .DestinationOut
+    }
+    let paint = surfacePaint(session, move texture, alpha)
+    return wholeTargetDraw(session, move paint, .None, narrowing)
+}
+
+// A clip shape's coverage, in its own transform, as a surface's alpha: the
+// shape drawn opaque as any item is, a primitive, a filled path or a stroke.
+function shapeCoverage(
+    session: borrow mut RenderSession,
+    clip: borrow ShapeClip
+) -> Result<GraphicsTexture, RenderFailure> {
+    let texture = match surface(session, "renderbox-clip-layer") {
+        Ok(texture) -> texture
+        Error(failure) -> return .Error(failure)
+    }
+    let item = ShapeItem {
+        shape: copy clip.shape,
+        fill: .Color(ColorFill { color: ClipPaint.coverage, colorSpace: .Device }),
+        alpha: 1,
+        blendMode: .Normal,
+        state: DrawingState { transform: copy clip.transform }
+    }
+    let recorded = match shapeDraw(session, item) {
+        Ok(recorded) -> recorded
+        Error(failure) -> return .Error(failure)
+    }
+    var draws: [RecordedDraw] = []
+    appendDraw(draws, move recorded)
+    return match drawPass(session, texture, Surfaces.transparent, draws) {
+        Ok -> .Ok(texture)
+        Error(failure) -> .Error(failure)
+    }
+}

@@ -1,0 +1,112 @@
+import Foundation
+
+// RB::Coverage::Primitive's kinds: the shapes RenderBox draws analytically,
+// without flattening them to a path.
+public enum PrimitiveKind: UN8 {
+    Empty = 0
+    Infinite = 1
+    Rect = 2
+    RoundedRect = 3
+    ContinuousRoundedRect = 4
+    Ellipse = 5
+    ButtLine = 6
+    RoundLine = 7
+    SquareLine = 8
+}
+
+public struct CornerRadii {
+    var topLeft: Number = 0
+    var topRight: Number = 0
+    var bottomRight: Number = 0
+    var bottomLeft: Number = 0
+}
+
+// An analytic shape. A rounded rect with elliptical corners is stored squeezed
+// horizontally by `horizontalScale` so its corners are circular, as RenderBox
+// stores it.
+public struct Primitive {
+    var kind: PrimitiveKind = .Empty
+    var rect: Rect = Rect()
+    var cornerRadii: CornerRadii = CornerRadii()
+    var horizontalScale: Number = 1
+    // Zero for a filled shape.
+    var lineWidth: Number = 0
+    var renderingMode: RenderingMode = .Antialiased
+    // The distance a distance mode reaches, or a blurred primitive's blur.
+    var renderingModeArgument: Number = 0
+    // The flags make_shadow sets: coverage outside the shape rather than in
+    // it, coverage the blend may stop at by alpha rather than by shape, and
+    // `renderingModeArgument` a Gaussian's deviation the edge is blurred by.
+    var inverted: Bool = false
+    var coversByAlpha: Bool = false
+    var blurred: Bool = false
+}
+
+namespace PrimitiveGeometry {
+    // A continuous corner reaches further along each edge than a circular one
+    // of the same radius: RenderBox stores its radius scaled by this, from
+    // set_rounded_rect.
+    let continuousCornerExtent: Number = 1.274999976158142
+}
+
+// RB::clamp_corner_size: neither side of a corner reaches past the middle of
+// the rect's shorter edge.
+function clampedCornerSize(corner: borrow Size, rect: borrow Rect) -> Size {
+    let limit = min(abs(rect.width), abs(rect.height)) / 2
+    return Size {
+        width: min(max(corner.width, 0), limit),
+        height: min(max(corner.height, 0), limit)
+    }
+}
+
+// set_rounded_rect(RBShape*, CGRect, CGSize, RBRoundedCornerStyle, double).
+function roundedPrimitive(
+    rect: borrow Rect,
+    corner: borrow Size,
+    style: RoundedCornerStyle,
+    lineWidth: Number
+) -> Primitive {
+    if corner.width <= 0 || corner.height <= 0 {
+        return Primitive { kind: .Rect, rect: copy rect, lineWidth: lineWidth }
+    }
+    var size = clampedCornerSize(corner, rect)
+    let kind = roundedKind(rect, size, style)
+    if style == .Continuous {
+        size = Size {
+            width: size.width * PrimitiveGeometry.continuousCornerExtent,
+            height: size.height * PrimitiveGeometry.continuousCornerExtent
+        }
+    }
+    let aspect = size.width / size.height
+    let radius = size.height
+    return Primitive {
+        kind: kind,
+        rect: Rect {
+            x: rect.x / aspect,
+            y: rect.y,
+            width: rect.width / aspect,
+            height: rect.height
+        },
+        cornerRadii: CornerRadii {
+            topLeft: radius,
+            topRight: radius,
+            bottomRight: radius,
+            bottomLeft: radius
+        },
+        horizontalScale: aspect,
+        lineWidth: lineWidth
+    }
+}
+
+// A circular-cornered square whose corners meet is an ellipse.
+function roundedKind(
+    rect: borrow Rect,
+    corner: borrow Size,
+    style: RoundedCornerStyle
+) -> PrimitiveKind {
+    if style == .Continuous {
+        return .ContinuousRoundedRect
+    }
+    let square = rect.width == rect.height && corner.width == corner.height
+    return square && corner.width * 2 == rect.width ? .Ellipse : .RoundedRect
+}

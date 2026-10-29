@@ -1,0 +1,155 @@
+import Foundation
+
+// make_vertex_grid, make_bezier_grid, make_coons_patches and
+// make_tensor_patches: a mesh's patches, each committed against `bounds`.
+// `colors` are the mesh's colours already converted for its interpolation.
+function meshPatches(
+    mesh: borrow MeshGradient,
+    colors: borrow [RGBAColor],
+    bounds: borrow Rect
+) -> MeshPatches {
+    var committed = MeshPatches()
+    match mesh.kind {
+        VertexGrid, BezierGrid -> {
+            for y in 0..mesh.height() - 1 {
+                for x in 0..mesh.width - 1 {
+                    commitPatch(committed, gridPatch(mesh, colors, x, y), bounds)
+                }
+            }
+        }
+        CoonsPatches, TensorPatches -> {
+            for element in 0..mesh.count() {
+                commitPatch(committed, elementPatch(mesh, colors, element), bounds)
+            }
+        }
+        // Triangles are not patches.
+        TriangleGrid, Triangles -> {}
+    }
+    return committed
+}
+
+// The grid's cell from point (x, y): A (x, y), B (x, y + 1), C (x + 1, y)
+// and D (x + 1, y + 1) are its corners P0 to P3.
+function gridPatch(
+    mesh: borrow MeshGradient,
+    colors: borrow [RGBAColor],
+    x: Number,
+    y: Number
+) -> MeshPatch {
+    let corners = [
+        gridPoint(mesh, x, y, 0), gridPoint(mesh, x, y + 1, 0),
+        gridPoint(mesh, x + 1, y, 0), gridPoint(mesh, x + 1, y + 1, 0)
+    ]
+    let edges = mesh.kind == .BezierGrid ? bezierEdges(mesh, x, y) : vertexEdges(mesh, x, y)
+    let points = coonsInterior(edgePatch(corners, edges))
+    return MeshPatch { points: points, colors: gridColors(mesh, colors, x, y) }
+}
+
+// Point (x, y)'s position, or for a bezier grid its control `part`: left,
+// top, right and bottom after the position.
+function gridPoint(mesh: borrow MeshGradient, x: Number, y: Number, part: Number) -> Point {
+    let index = y * mesh.width + x
+    return mesh.kind == .BezierGrid ? copy mesh.positions[index * 5 + part] : copy mesh.positions[index]
+}
+
+namespace BezierPart {
+    let left: Number = 1
+    let top: Number = 2
+    let right: Number = 3
+    let bottom: Number = 4
+}
+
+// make_bezier_grid: each edge point is the control its corner names.
+function bezierEdges(mesh: borrow MeshGradient, x: Number, y: Number) -> [(Number, Point)] {
+    return [
+        (1, gridPoint(mesh, x, y, BezierPart.bottom)),
+        (2, gridPoint(mesh, x, y + 1, BezierPart.top)),
+        (4, gridPoint(mesh, x, y, BezierPart.right)),
+        (7, gridPoint(mesh, x, y + 1, BezierPart.right)),
+        (8, gridPoint(mesh, x + 1, y, BezierPart.left)),
+        (11, gridPoint(mesh, x + 1, y + 1, BezierPart.left)),
+        (13, gridPoint(mesh, x + 1, y, BezierPart.bottom)),
+        (14, gridPoint(mesh, x + 1, y + 1, BezierPart.top))
+    ]
+}
+
+// make_vertex_grid: each edge runs from its corner a third of the chord
+// along the mean of the chord's direction and its neighbour's.
+function vertexEdges(mesh: borrow MeshGradient, x: Number, y: Number) -> [(Number, Point)] {
+    var edges: [(Number, Point)] = []
+    for (row, first, second) in [(y, 4, 8), (y + 1, 7, 11)] {
+        let along = gridHandles(mesh, x, row, 1, 0)
+        edges.append((first, pointPlus(gridPoint(mesh, x, row, 0), along.0)))
+        edges.append((second, pointPlus(gridPoint(mesh, x + 1, row, 0), along.1)))
+    }
+    for (column, first, second) in [(x, 1, 2), (x + 1, 13, 14)] {
+        let down = gridHandles(mesh, column, y, 0, 1)
+        edges.append((first, pointPlus(gridPoint(mesh, column, y, 0), down.0)))
+        edges.append((second, pointPlus(gridPoint(mesh, column, y + 1, 0), down.1)))
+    }
+    return edges
+}
+
+// The handles at either end of the chord from (x, y) one step along
+// (dx, dy), as offsets from its ends.
+function gridHandles(mesh: borrow MeshGradient, x: Number, y: Number, dx: Number, dy: Number) -> (
+    Point,
+    Point
+) {
+    let from = gridPoint(mesh, x, y, 0)
+    let to = gridPoint(mesh, x + dx, y + dy, 0)
+    let chord = pointMinus(to, from)
+    let third = sqrt(chord.x * chord.x + chord.y * chord.y) / 3
+    let current = unitPoint(chord)
+    var before = Point()
+    if x - dx >= 0 && y - dy >= 0 {
+        before = unitPoint(pointMinus(from, gridPoint(mesh, x - dx, y - dy, 0)))
+    }
+    var after = Point()
+    if x + 2 * dx < mesh.width && y + 2 * dy < mesh.height() {
+        after = unitPoint(pointMinus(gridPoint(mesh, x + 2 * dx, y + 2 * dy, 0), to))
+    }
+    let start = pointScaled(unitPoint(pointPlus(before, current)), third)
+    let end = pointScaled(unitPoint(pointPlus(current, after)), -third)
+    return (start, end)
+}
+
+// `point` over its length; none for no length.
+function unitPoint(point: borrow Point) -> Point {
+    let length = sqrt(point.x * point.x + point.y * point.y)
+    return length == 0 ? Point() : pointScaled(point, 1 / length)
+}
+
+// make_coons_patches and make_tensor_patches: patch `element`, its colours
+// k0 to k3 round it as c0, c1, c3 and c2.
+function elementPatch(
+    mesh: borrow MeshGradient,
+    colors: borrow [RGBAColor],
+    element: Number
+) -> MeshPatch {
+    let order = [copy colors[element * 4], copy colors[element * 4 + 1], copy colors[element * 4 + 3], copy colors[element * 4 + 2]]
+    if mesh.kind == .TensorPatches {
+        let first = element * 16
+        let corners = [
+            copy mesh.positions[first], copy mesh.positions[first + 3],
+            copy mesh.positions[first + 12], copy mesh.positions[first + 15]
+        ]
+        var edges: [(Number, Point)] = []
+        for index in 0..16 {
+            if !isCorner(index) {
+                edges.append((index, copy mesh.positions[first + index]))
+            }
+        }
+        return MeshPatch { points: edgePatch(corners, edges), colors: order }
+    }
+    let first = element * 12
+    let corners = [
+        copy mesh.positions[first], copy mesh.positions[first + 3],
+        copy mesh.positions[first + 9], copy mesh.positions[first + 6]
+    ]
+    var edges: [(Number, Point)] = []
+    for (index, point) in [(1, 1), (2, 2), (4, 11), (7, 4), (8, 10), (11, 5), (13, 8), (14, 7)] {
+        edges.append((index, copy mesh.positions[first + point]))
+    }
+    return MeshPatch { points: coonsInterior(edgePatch(corners, edges)), colors: order }
+}

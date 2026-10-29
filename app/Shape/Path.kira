@@ -1,0 +1,90 @@
+import Foundation
+
+public struct QuadraticSegment {
+    let control: Point
+    let end: Point
+}
+
+public struct CubicSegment {
+    let firstControl: Point
+    let secondControl: Point
+    let end: Point
+}
+
+// RBPathElement. Its codes are Core Graphics' CGPathElementType, which is why
+// RenderBox walks a CGPath's elements without translating them.
+public enum PathElement {
+    MoveTo(Point)
+    LineTo(Point)
+    QuadraticTo(QuadraticSegment)
+    CubicTo(CubicSegment)
+    CloseSubpath
+}
+
+// RBPath: a sequence of subpaths.
+public struct Path {
+    var elements: [PathElement] = []
+}
+
+extend Path {
+    function move (to: Point) -> Path {
+        return appending(.MoveTo(to))
+    }
+
+    function line(to: Point) -> Path {
+        return appending(.LineTo(to))
+    }
+
+    function quadratic(to: Point, control: Point) -> Path {
+        return appending(.QuadraticTo(QuadraticSegment { control: control, end: to }))
+    }
+
+    function cubic(to: Point, firstControl: Point, secondControl: Point) -> Path {
+        return appending(
+            .CubicTo(
+                CubicSegment { firstControl: firstControl, secondControl: secondControl, end: to }
+            )
+        )
+    }
+
+    function closed() -> Path {
+        return appending(.CloseSubpath)
+    }
+
+    function appending(element: PathElement) -> Path {
+        var result = copy self
+        result.elements.append(move element)
+        return result
+    }
+
+    function transformed(transform: borrow AffineTransform) -> Path {
+        var result = Path()
+        for element in elements {
+            result.elements.append(element.transformed(transform))
+        }
+        return result
+    }
+}
+
+extend PathElement {
+    function transformed(transform: borrow AffineTransform) -> PathElement {
+        return match self {
+            MoveTo(point) -> .MoveTo(transform.applying(point))
+            LineTo(point) -> .LineTo(transform.applying(point))
+            QuadraticTo(segment) -> .QuadraticTo(
+                QuadraticSegment {
+                    control: transform.applying(segment.control),
+                    end: transform.applying(segment.end)
+                }
+            )
+            CubicTo(segment) -> .CubicTo(
+                CubicSegment {
+                    firstControl: transform.applying(segment.firstControl),
+                    secondControl: transform.applying(segment.secondControl),
+                    end: transform.applying(segment.end)
+                }
+            )
+            CloseSubpath -> .CloseSubpath
+        }
+    }
+}

@@ -1,0 +1,88 @@
+import Foundation
+import RenderBox
+
+// `top` drawn through `blend` over `bottom`, both over the whole target.
+function blendedOver(
+    bottom: borrow RGBAColor,
+    top: borrow RGBAColor,
+    blend: BlendMode
+) -> Result<[UN8], RenderFailure> {
+    let side = Number(RenderTarget.side)
+    var shape = Shape()
+    shape.setRect(Rect { width: side, height: side })
+    var list = DisplayList()
+    var under = Fill()
+    under.setColor(copy bottom, .StandardRgb)
+    list.drawShape(shape, under, 1, .Normal)
+    var over = Fill()
+    over.setColor(copy top, .StandardRgb)
+    list.drawShape(shape, over, 1, blend)
+    return renderLayer(
+        list.moveContents(),
+        RenderTarget.side,
+        RenderTarget.side,
+        RenderTarget.clear
+    )
+}
+
+function middle() -> [Point] {
+    return [Point { x: 4, y: 4 }]
+}
+
+// Half-opaque blue multiplied over red: S D + S (1 - Da) + D (1 - Sa).
+@Test
+function multiplyReadsTheDestination() {
+    expect!(multiplyReadsTheDestinationResult() == "128/255")
+}
+
+function multiplyReadsTheDestinationResult() -> String {
+    let red = RGBAColor { r: 1, g: 0, b: 0, a: 1 }
+    let blue = RGBAColor { r: 0, g: 0, b: 1, a: 0.5 }
+    return sampled(blendedOver(red, blue, .Multiply), middle())
+}
+
+// Hard light of a source under half its alpha multiplies, doubled: 2 S D,
+// 2 x 0.25 x 0.5, which the target holds as 64/255.
+@Test
+function hardLightMultipliesADarkSource() {
+    expect!(hardLightOverHalfRed(0.25) == "64/255")
+}
+
+// Over half its alpha it screens: Sa Da - 2 (Da - D) (Sa - S),
+// 1 - 2 x 0.5 x 0.25, 191.25 rounding down.
+@Test
+function hardLightScreensALightSource() {
+    expect!(hardLightOverHalfRed(0.75) == "191/255")
+}
+
+function hardLightOverHalfRed(red: Number) -> String {
+    let half = RGBAColor { r: 0.5, g: 0, b: 0, a: 1 }
+    let source = RGBAColor { r: red, g: 0, b: 0, a: 1 }
+    return sampled(blendedOver(half, source, .HardLight), middle())
+}
+
+// Quarter-opaque red plus half-opaque red, which the target holds as
+// 128/255: 191.75 rounds up.
+@Test
+function plusLighterAdds() {
+    expect!(plusLighterAddsResult() == "192/192")
+}
+
+function plusLighterAddsResult() -> String {
+    let half = RGBAColor { r: 1, g: 0, b: 0, a: 0.5 }
+    let quarter = RGBAColor { r: 1, g: 0, b: 0, a: 0.25 }
+    return sampled(blendedOver(half, quarter, .PlusLighter), middle())
+}
+
+// Half-opaque red plus darker over opaque black takes the alpha past one
+// from the colour.
+@Test
+function plusDarkerTakesTheExcess() {
+    expect!(plusDarkerTakesTheExcessResult() == "0/255")
+}
+
+function plusDarkerTakesTheExcessResult() -> String {
+    let black = RGBAColor { r: 0, g: 0, b: 0, a: 1 }
+    let red = RGBAColor { r: 1, g: 0, b: 0, a: 0.5 }
+    return sampled(blendedOver(black, red, .PlusDarker), middle())
+}

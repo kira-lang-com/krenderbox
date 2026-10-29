@@ -1,0 +1,243 @@
+// RenderBox's path_exterior_vertex and path_exterior_fragment: every
+// flattened edge of a path adds its signed, antialiased area to an
+// accumulator, and the accumulator's sum is the path's winding coverage.
+//
+// An edge covers a quad from its left end to the path's right edge over the
+// rows it spans. Within each pixel row the fragment measures the part of the
+// row to the right of the edge, so summing every edge gives, at each pixel, the
+// winding number with the edges' crossings antialiased.
+//
+// The segment buffer is RB::Path::Accumulator's, one record of eight floats
+// per RB::Shader::Path::CubicSegment: the first subdivision's index, the step
+// in t per subdivision, the two control points and the end. Record zero is the
+// header: the record count and the subdivision count. A segment starts where
+// the record before it ends; a record whose first control point is infinite
+// starts a subpath at its end. When every segment is a line the buffer holds
+// points instead, two floats each, after a header whose first float is the
+// point count; an infinite point separates subpaths.
+
+type PathGlobals {
+    // Path space to device pixels: x * matrix.xy + y * matrix.zw + translation.
+    let matrix: Float4
+    let translation: Float2
+    // Device pixels to clip space: x * scale.x - 1, 1 - y * scale.y.
+    let scale: Float2
+    // The point path_interior's triangles fan out from: the centre of the
+    // path's bounds.
+    let pivot: Float2
+    let depth: Float
+    // Where every edge's quad ends on the right, in device pixels.
+    let right: Float
+    // 1 when the buffer holds points, 0 when it holds cubic segments.
+    let lines: Float
+    // How far path_distance measures from an edge, in path units.
+    let distance: Float
+}
+
+type PathSegment {
+    let first: Float
+    let step: Float
+    let control1: Float2
+    let control2: Float2
+    let end: Float2
+}
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+    // The rows the edge spans, top first.
+    @interpolate(linear)
+    let rows: Float2
+    // The edge's x per unit of y, and its x where y is zero.
+    @interpolate(linear)
+    let slope: Float
+    @interpolate(linear)
+    let intercept: Float
+    // 1 for an edge going down, -1 for one going up.
+    @interpolate(linear)
+    let direction: Float
+}
+
+// A half target written as a half, as path_exterior_fragment's half2:
+// the blend then adds halves, rounding each sum to nearest.
+type FragmentOut {
+    let color: Half4
+}
+
+// RB::Path::Accumulator's quads per instance: thirteen edges.
+const quadVertices: UInt = 6
+// Below this many pixels of height an edge adds nothing.
+const flatEdge: Float = 0.0001
+// What RenderBox stores where a subpath breaks.
+const infinite: Float = 3.0e38
+
+function isBreak(value: Float) -> Bool {
+    return abs(value) > infinite
+}
+
+// The cubic from `start` through the record's controls at `t`, in the power
+// basis exterior_vertex evaluates.
+function cubicAt(start: Float2, record: PathSegment, t: Float) -> Float2 {
+    let b = (record.control1 - start) * 3.0
+    let c = ((record.control2 - record.control1) - (record.control1 - start)) * 3.0
+    let d = (record.control1 - start) + fma(record.control2 - record.control1, Float2(-2.0, -2.0), record.end - record.control2)
+    let tt = Float2(t, t)
+    return fma(fma(fma(d, tt, c), tt, b), tt, start)
+}
+
+shader PathExterior {
+    group Path {
+        uniform pathGlobals: PathGlobals
+        storage read segments: [PathSegment]
+    }
+
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        // The float2 at `index` of a point buffer laid over the segment records.
+        function pointAt(index: UInt) -> Float2 {
+            let record = segments[index / UInt(4)]
+            let lane = index % UInt(4)
+            if lane == UInt(0) {
+                return Float2(record.first, record.step)
+            }
+            if lane == UInt(1) {
+                return record.control1
+            }
+            if lane == UInt(2) {
+                return record.control2
+            }
+            return record.end
+        }
+
+        // The last record whose first subdivision is at or before `index`, by the
+        // binary search exterior_vertex runs over the records after the header.
+        function segmentFor(index: Float) -> UInt {
+            let base = UInt(1)
+            let count = UInt(segments[0].first)
+            while count > UInt(1) {
+                let half = count / UInt(2)
+                let middle = base + half
+                if segments[middle].first > index {
+                    count = half
+                } else {
+                    base = middle
+                    count = count - half
+                }
+            }
+            return base
+        }
+
+        function toDevice(point: Float2) -> Float2 {
+            return pathGlobals.matrix.xy * point.x + pathGlobals.matrix.zw * point.y + pathGlobals.translation
+        }
+
+        function entry(input: VertexIn) -> VertexOut {
+            let edge = input.vid / quadVertices
+            let corner = input.vid % quadVertices
+            // Two triangles over corners 0 1 2 and 0 2 3.
+            if corner == UInt(3) {
+                corner = UInt(0)
+            }
+            if corner > UInt(3) {
+                corner = corner - UInt(2)
+            }
+            let from = Float2(0.0, 0.0)
+            let to = Float2(0.0, 0.0)
+            let valid = false
+            if pathGlobals.lines == 1.0 {
+                if UInt(segments[0].first) > edge {
+                    from = pointAt(edge + UInt(1))
+                    to = pointAt(edge + UInt(2))
+                    valid = !isBreak(from.x) && !isBreak(to.x)
+                }
+            } else {
+                if segments[0].step > Float(edge) {
+                    let at = segmentFor(Float(edge))
+                    let record = segments[at]
+                    if !isBreak(record.control1.x) {
+                        let start = segments[at - UInt(1)].end
+                        let index = Float(edge) - record.first
+                        from = cubicAt(start, record, record.step * index)
+                        to = cubicAt(start, record, record.step * (index + 1.0))
+                        valid = true
+                    }
+                }
+            }
+            let a = toDevice(from)
+            let b = toDevice(to)
+            let delta = b - a
+            let out: VertexOut
+            out.clip_position = Float4(-2.0, -2.0, 0.0, 1.0)
+            if !valid || abs(delta.y) <= flatEdge {
+                return out
+            }
+            let slope = delta.x / delta.y
+            let down = delta.y > 0.0
+            let rows = Float2(b.y, a.y)
+            if down {
+                rows = Float2(a.y, b.y)
+            }
+            let x = pathGlobals.right + 0.5
+            if corner == UInt(0) || corner == UInt(3) {
+                x = min(a.x, b.x) - 0.5
+            }
+            let y = rows.y + 0.5
+            if corner < UInt(2) {
+                y = rows.x - 0.5
+            }
+            out.clip_position = Float4(
+                x * pathGlobals.scale.x - 1.0,
+                1.0 - y * pathGlobals.scale.y,
+                pathGlobals.depth,
+                1.0,
+            )
+            out.rows = rows
+            out.slope = slope
+            out.intercept = fma(a.y, -slope, a.x)
+            out.direction = -1.0
+            if down {
+                out.direction = 1.0
+            }
+            return out
+        }
+    }
+
+    fragment {
+        input VertexOut
+        output FragmentOut
+
+        // exterior_shape: the part of this pixel's row the edge spans, times
+        // the share of the pixel right of the edge across that span.
+        function entry(input: VertexOut) -> FragmentOut {
+            let pixel = floor(input.clip_position.xy)
+            let top = max(pixel.y, input.rows.x)
+            let bottom = min(pixel.y + 1.0, input.rows.y)
+            let offset = input.intercept - pixel.x
+            let crossings = fma(Float2(top, bottom), Float2(input.slope, input.slope), Float2(offset, offset))
+            if input.slope < 0.0 {
+                crossings = crossings.yx
+            }
+            let clamped = clamp(crossings, Float2(0.0, 0.0), Float2(1.0, 1.0))
+            let width = crossings.y - crossings.x
+            let height = clamp(bottom - top, 0.0, 1.0)
+            let covered = fma(clamped.y, -height, height)
+            if width != 0.0 {
+                let middle = fma(clamped.x, 0.5, fma(clamped.y, 0.5, -crossings.x))
+                let across = height * middle / width
+                covered = fma(clamped.y, across, fma(-clamped.x, across, covered))
+            }
+            // exterior_shape's half, times the edge's half sign.
+            let signed = Half(covered) * Half(input.direction)
+            let result: FragmentOut
+            result.color = Half4(0.0, signed, 0.0, 0.0)
+            return result
+        }
+    }
+}

@@ -1,0 +1,61 @@
+import Foundation
+
+// RenderBox keeps gradient stops and their coefficients as halves; the shader
+// here reads 32-bit floats, so every value it is given is first rounded to
+// the nearest half, ties to even, the way a float-to-half conversion rounds.
+namespace HalfFloat {
+    // The largest half, which RenderBox also stores for a scale that would
+    // be infinite.
+    let maximum: Number = 65504
+    // A float's mantissa bits and a half's.
+    let floatMantissa: UN32 = 23
+    let halfMantissa: UN32 = 10
+    // The smallest exponent a half holds unscaled, and the one below the
+    // smallest it can round to.
+    let normalExponent: Number = -14
+    let lowestExponent: Number = -25
+    let floatBias: Number = 127
+}
+
+function halfRounded(value: Number) -> Number {
+    if abs(value) >= HalfFloat.maximum {
+        return value < 0 ? -HalfFloat.maximum : HalfFloat.maximum
+    }
+    let bits = UN32(floatToBits32(F32(value)))
+    let exponent = Number((bits >> HalfFloat.floatMantissa) & 0xff) - HalfFloat.floatBias
+    if exponent < HalfFloat.lowestExponent {
+        return 0
+    }
+    if exponent == HalfFloat.lowestExponent {
+        return roundedToSmallest(value, bits)
+    }
+    var dropped = HalfFloat.floatMantissa - HalfFloat.halfMantissa
+    if exponent < HalfFloat.normalExponent {
+        dropped += UN32(HalfFloat.normalExponent - exponent)
+    }
+    return Number(Float(bitsToFloat32(U32(roundedBits(bits, dropped)))))
+}
+
+// `bits` with its lowest `dropped` bits rounded away, to nearest, ties to
+// even; a carry runs into the exponent.
+function roundedBits(bits: UN32, dropped: UN32) -> UN32 {
+    let unit: UN32 = 1 << dropped
+    let low = bits & (unit - 1)
+    let kept = bits - low
+    let tie = unit >> 1
+    if low > tie || (low == tie && (kept & unit) != 0) {
+        return kept + unit
+    }
+    return kept
+}
+
+// Between half the smallest half and the smallest: up to the smallest, but a
+// tie goes to zero.
+function roundedToSmallest(value: Number, bits: UN32) -> Number {
+    let mantissa = bits & ((1 << HalfFloat.floatMantissa) - 1)
+    if mantissa == 0 {
+        return 0
+    }
+    let smallest = Number(Float(bitsToFloat32(U32(0x33800000))))
+    return value < 0 ? -smallest : smallest
+}

@@ -1,0 +1,407 @@
+// RenderBox's primitive pipeline: primitive__vertex, primitive_distance,
+// primitive_shape and primitive_color_fragment's fixed-function composite.
+//
+// RenderBox selects the primitive type and coverage mode with function
+// constants; here they are uniforms, so one pipeline per blend draws every
+// kind. Branches on a uniform stay in uniform control flow, which the
+// derivatives below require.
+
+type PrimitiveGlobals {
+    // The unit square to clip space: x * matrix.xy + y * matrix.zw + translation.
+    let matrix: Float4
+    let translation: Float2
+    // `b` of the distance functions, in units of the primitive's height.
+    let halfSize: Float2
+    let radii: Float4
+    let horizontalScale: Float
+    let halfLineWidth: Float
+    // The coverage multiplier, below one for strokes thinner than a pixel.
+    let alpha: Float
+    // RB::Shader::PrimitiveType, 0 to 11.
+    let shapeType: Float
+    // The coverage mode: 0 antialiased, 1 aliased, 2 blurred, 3 distance.
+    let coverageMode: Float
+    // 1 when the distance is a stroke's, |d| less half the line width.
+    let stroke: Float
+    // 1 when coverage is inverted.
+    let invert: Float
+    let depth: Float
+    // The blurred and distance modes' scale and offset.
+    let distanceParameters: Float2
+    // The fill colour, premultiplied; a texture fill's texels are multiplied
+    // by it.
+    let color: Float4
+    // Device pixel to the fill texture's coordinates:
+    // x * fillMatrix.xy + y * fillMatrix.zw + fillTranslation.
+    let fillMatrix: Float4
+    let fillTranslation: Float2
+    // 1 when the fill is the texture, 0 when it is the colour alone.
+    let textured: Float
+    // 1 when the clip mask's alpha multiplies coverage.
+    let masked: Float
+    // Device pixel to the clip mask's and the destination's coordinates.
+    let maskScale: Float2
+    // RB::BlendMode when the shader blends, reading the destination.
+    let blendCode: Float
+    // 1 when the shader blends: the draw writes through, mixing the
+    // destination and the blend of the paint over it by coverage.
+    let shaderBlend: Float
+    // Image::sample's conversion of the fill texture's texels: whether to
+    // convert, decode and encode, then the primaries' matrix by column.
+    let conversion: Float4
+    let fromRed: Float4
+    let fromGreen: Float4
+    let fromBlue: Float4
+}
+
+// RB::Shader::Image::sample's conversion of a texel from the image's colour
+// space into the pass's: unpremultiplied where its alpha is above a half's
+// 0x1419, decoded by RB::Shader::Tables, through the primaries' matrix,
+// encoded by the tables and premultiplied again. A table's entry is the sRGB
+// transfer at the middle of the eight halves sharing a half's bits over
+// eight, rounded to a half, as `app/Render/TransferTables.kira` builds it.
+const halfSmallest: Float = 0.00006103515625
+const halfTiny: Float = 0.000000059604644775390625
+const unpremultiplyBelow: Float = 0.0010004
+const tableOne: Float = 1920.0
+const tableInfinite: Float = 3968.0
+
+// A half's bits for the half nearest `value`, which is not negative.
+function halfBits(value: Float) -> Float {
+    if value < halfSmallest {
+        return round(value / halfTiny)
+    }
+    let exponent = floor(log2(value))
+    if exp2(exponent) > value {
+        exponent = exponent - 1.0
+    }
+    if exp2(exponent + 1.0) <= value {
+        exponent = exponent + 1.0
+    }
+    let mantissa = round((value / exp2(exponent) - 1.0) * 1024.0)
+    return (exponent + 15.0) * 1024.0 + mantissa
+}
+
+function halfValue(bits: Float) -> Float {
+    let exponent = floor(bits / 1024.0)
+    let mantissa = bits - exponent * 1024.0
+    if exponent == 0.0 {
+        return mantissa * halfTiny
+    }
+    return (1.0 + mantissa / 1024.0) * exp2(exponent - 15.0)
+}
+
+function srgbEncoded(x: Float) -> Float {
+    if x <= 0.0031308 {
+        return x * 12.92
+    }
+    return pow(x, 0.41667) * 1.055 - 0.055
+}
+
+function srgbDecoded(x: Float) -> Float {
+    if x <= 0.04045 {
+        return x * 0.07739938
+    }
+    return pow(x * 0.9478673 + 0.0521327, 2.4)
+}
+
+// The table's entry for `value`, keeping its sign.
+function tableEntry(value: Float, decoding: Bool) -> Float {
+    let index = floor(halfBits(abs(value)) / 8.0)
+    if index == 0.0 || index >= tableInfinite {
+        return value
+    }
+    let entry = 1.0
+    if index != tableOne {
+        let x = halfValue(index * 8.0 + 4.0)
+        let mapped = srgbEncoded(x)
+        if decoding {
+            mapped = srgbDecoded(x)
+        }
+        entry = halfValue(halfBits(mapped))
+    }
+    if value < 0.0 {
+        return -entry
+    }
+    return entry
+}
+
+// `texel` converted by `flags` (whether to convert, decode, encode) and the
+// primaries' columns.
+function convertedTexel(texel: Float4, flags: Float4, fromRed: Float4, fromGreen: Float4, fromBlue: Float4) -> Float4 {
+    if flags.x == 0.0 {
+        return texel
+    }
+    let alpha = texel.w
+    let rgb = Float3(0.0, 0.0, 0.0)
+    if alpha > unpremultiplyBelow {
+        rgb = texel.xyz / alpha
+    }
+    if flags.y == 1.0 {
+        rgb = Float3(tableEntry(rgb.x, true), tableEntry(rgb.y, true), tableEntry(rgb.z, true))
+    }
+    rgb = fromRed.xyz * rgb.x + fromGreen.xyz * rgb.y + fromBlue.xyz * rgb.z
+    if flags.z == 1.0 {
+        rgb = Float3(tableEntry(rgb.x, false), tableEntry(rgb.y, false), tableEntry(rgb.z, false))
+    }
+    return Float4(rgb * alpha, alpha)
+}
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+    let local: Float2
+}
+
+type FragmentOut {
+    let color: Half4
+}
+
+// The continuous corner's bulge, fitted by RenderBox to Apple's squircle.
+const continuousNearWeight: Float = 0.3610000014305115
+const continuousReachWeight: Float = 0.6389999985694885
+const continuousReachScale: Float = 0.25
+const bulgeCubic: Float = -0.5384100079536438
+const bulgeQuadratic: Float = 1.346024990081787
+const bulgeLinear: Float = -0.897350013256073
+// What an empty shape and an infinite one measure everywhere.
+const farDistance: Float = 100000.0
+
+// A circular corner of radius `radius`: q is |p| less the inner box.
+function roundedDistance(q: Float2, radius: Float) -> Float {
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius
+}
+
+function continuousDistance(q: Float2, radius: Float) -> Float {
+    let outside = max(q, 0.0)
+    let reach = length(outside)
+    let near = min(abs(outside.x), abs(outside.y))
+    let far = max(abs(outside.x), abs(outside.y)) + max(radius - reach, 0.0) * continuousReachScale
+    let weight = near * continuousNearWeight + far * continuousReachWeight
+    let k = 0.0
+    if weight != 0.0 {
+        k = near / weight
+    }
+    let bulge = k * k * k * (k * (k * bulgeCubic + bulgeQuadratic) + bulgeLinear)
+    return min(max(q.x, q.y), 0.0) + bulge * radius + reach - radius
+}
+
+// The radius of the corner in `p`'s quadrant: x, y above the middle, w, z
+// below.
+function cornerRadius(p: Float2, radii: Float4) -> Float {
+    let pair = Float2(radii.w, radii.z)
+    if p.y < 0.0 {
+        pair = Float2(radii.x, radii.y)
+    }
+    if p.x < 0.0 {
+        return pair.x
+    }
+    return pair.y
+}
+
+function primitiveDistance(shapeType: Float, p: Float2, b: Float2, radii: Float4) -> Float {
+    if shapeType == 1.0 {
+        return -farDistance
+    }
+    if shapeType == 2.0 || shapeType == 11.0 {
+        let q = abs(p) - b
+        return max(q.x, q.y)
+    }
+    if shapeType == 3.0 {
+        return roundedDistance(abs(p) - b, radii.x)
+    }
+    if shapeType == 4.0 {
+        return continuousDistance(abs(p) - b, radii.x)
+    }
+    if shapeType == 5.0 {
+        return length(p) - radii.x
+    }
+    if shapeType == 6.0 {
+        let radius = cornerRadius(p, radii)
+        return roundedDistance(abs(p) - (b - radius), radius)
+    }
+    if shapeType == 7.0 {
+        let radius = cornerRadius(p, radii)
+        return continuousDistance(abs(p) - (b - radius), radius)
+    }
+    return farDistance
+}
+
+// The exact box-filtered area of a thin rect under the pixel.
+function rectArea(p: Float2, b: Float2) -> Float {
+    let footprint = fwidth(p)
+    let low = max(p - footprint * 0.5, -b)
+    let high = min(p + footprint * 0.5, b)
+    let extent = max(high - low, 0.0)
+    return clamp(extent.x * extent.y / (footprint.x * footprint.y), 0.0, 1.0)
+}
+
+function smoothCoverage(t: Float) -> Float {
+    return t * t * (t * -2.0 + 3.0)
+}
+
+function coverage(globals: PrimitiveGlobals, local: Float2) -> Float {
+    if globals.shapeType == 11.0 {
+        return rectArea(local, globals.halfSize) * globals.alpha
+    }
+    let d = primitiveDistance(globals.shapeType, local, globals.halfSize, globals.radii)
+    if globals.stroke == 1.0 {
+        d = abs(d) - globals.halfLineWidth
+    }
+    let width = fwidth(d) * 0.5
+    let covered = 0.0
+    if globals.coverageMode == 0.0 {
+        covered = smoothCoverage(clamp((width - d) / (width + width), 0.0, 1.0))
+    }
+    if globals.coverageMode == 1.0 {
+        if d < width {
+            covered = 1.0
+        }
+    }
+    if globals.coverageMode == 2.0 {
+        covered = smoothCoverage(smoothCoverage(clamp(-d * globals.distanceParameters.x + 0.5, 0.0, 1.0)))
+    }
+    if globals.coverageMode == 3.0 {
+        covered = clamp(d * globals.distanceParameters.x + globals.distanceParameters.y, 0.0, 1.0)
+    }
+    if globals.invert == 1.0 {
+        covered = 1.0 - covered
+    }
+    return covered * globals.alpha
+}
+
+// RB::Shader::blend for the modes ported: the premultiplied source over the
+// premultiplied destination.
+function blended(code: Float, source: Float4, destination: Float4) -> Float4 {
+    let result = source
+    // Multiply: S D + S (1 - Da) + D (1 - Sa).
+    if code == 25.0 {
+        result = source * destination + source * (1.0 - destination.w) + destination * (1.0 - source.w)
+    }
+    // Hard light: where the source is over half its alpha, Sa Da less twice
+    // what each lacks of its alpha; under it, 2 S D. Either over
+    // S (1 - Da) + D (1 - Sa), alpha source over.
+    if code == 32.0 {
+        let screened = source.w * destination.w - 2.0 * (destination.w - destination.xyz) * (source.w - source.xyz)
+        let multiplied = 2.0 * source.xyz * destination.xyz
+        // The two meet where the source is half its alpha.
+        let lit = mix(multiplied, screened, step(Float3(source.w * 0.5), source.xyz))
+        let outside = source * (1.0 - destination.w) + destination * (1.0 - source.w)
+        result = Float4(outside.xyz + lit, source.w * destination.w + outside.w)
+    }
+    // Plus lighter and plus darker: the sum, alpha saturated; plus darker
+    // takes from colour what the saturation took from alpha.
+    if code == 43.0 || code == 44.0 {
+        let sum = source + destination
+        let alpha = clamp(sum.w, 0.0, 1.0)
+        result = Float4(sum.xyz, alpha)
+        if code == 44.0 {
+            result = Float4(sum.xyz + (alpha - sum.w), alpha)
+        }
+    }
+    // Distance field maximum: whichever distance in red is the greater.
+    if code == 51.0 {
+        result = destination
+        if source.x > destination.x {
+            result = source
+        }
+    }
+    // Distance field minimum: whichever is the lesser.
+    if code == 52.0 {
+        result = destination
+        if source.x < destination.x {
+            result = source
+        }
+    }
+    // Distance field minimum inverse: the source's distance inverted, when
+    // that is the lesser.
+    if code == 53.0 {
+        result = destination
+        if 1.0 - source.x < destination.x {
+            result = Float4(1.0 - source.xyz, source.w)
+        }
+    }
+    return result
+}
+
+shader Primitive {
+    group Draw {
+        uniform globals: PrimitiveGlobals
+        texture fill: Texture2d
+        sampler fillSampler: Sampler
+        texture mask: Texture2d
+        sampler maskSampler: Sampler
+    }
+
+    // What a shader-blended draw reads: the target as it was before it.
+    group Destination {
+        texture destination: Texture2d
+    }
+
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        // Two triangles over the unit square's corners 0 1 2 and 0 2 3:
+        // corner 1 and 2 at x = 1, corners 2 and 3 at y = 1.
+        function entry(input: VertexIn) -> VertexOut {
+            let corner = input.vid
+            if input.vid == UInt(3) {
+                corner = UInt(0)
+            }
+            if input.vid > UInt(3) {
+                corner = input.vid - UInt(2)
+            }
+            let unit = Float2(0.0, 0.0)
+            if corner == UInt(1) || corner == UInt(2) {
+                unit.x = 1.0
+            }
+            if corner > UInt(1) {
+                unit.y = 1.0
+            }
+            let position = globals.matrix.xy * unit.x + globals.matrix.zw * unit.y + globals.translation
+            let out: VertexOut
+            out.clip_position = Float4(position, globals.depth, 1.0)
+            out.local = Float2((unit.x - 0.5) * globals.horizontalScale, unit.y - 0.5)
+            return out
+        }
+    }
+
+    fragment {
+        input VertexOut
+        output FragmentOut
+
+        function entry(input: VertexOut) -> FragmentOut {
+            let device = input.clip_position.xy
+            let covered = coverage(globals, input.local)
+            let uv = globals.fillMatrix.xy * device.x + globals.fillMatrix.zw * device.y + globals.fillTranslation
+            let texel = convertedTexel(
+                sample(fill, fillSampler, uv),
+                globals.conversion,
+                globals.fromRed,
+                globals.fromGreen,
+                globals.fromBlue
+            )
+            let clipped = sample(mask, maskSampler, device * globals.maskScale).w
+            let paint = globals.color
+            if globals.textured == 1.0 {
+                paint = texel * globals.color
+            }
+            if globals.masked == 1.0 {
+                covered = covered * clipped
+            }
+            let below = sample(destination, maskSampler, device * globals.maskScale)
+            let result: FragmentOut
+            result.color = Half4(paint * covered)
+            if globals.shaderBlend == 1.0 {
+                result.color = Half4(mix(below, blended(globals.blendCode, paint, below), covered))
+            }
+            return result
+        }
+    }
+}

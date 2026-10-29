@@ -1,0 +1,73 @@
+import Foundation
+import Ember
+
+namespace ThresholdDrawing {
+    let pipeline: String = "renderbox-alpha-threshold"
+    let globalsFloatCount: UN32 = 16
+    let globalsBinding: UN32 = 0
+    let sourceBinding: UN32 = 1
+    let samplerBinding: UN32 = 2
+    let vertexCount: UN32 = 6
+}
+
+// AlphaThresholdEffect::render: the layer's channel thresholded to the
+// band, as the colour at its coverage. Fill::Color::prepare takes the
+// opacity into the colour, so the result composites at one.
+function alphaThresholded(
+    session: borrow mut RenderSession,
+    source: GraphicsTexture,
+    style: borrow AlphaThresholdStyle,
+    opacity: Number
+) -> Result<(GraphicsTexture, Number), RenderFailure> {
+    let target = try surface(session, "renderbox-alpha-threshold")
+    let pipeline = try namedPipeline(
+        session,
+        ThresholdDrawing.pipeline,
+        ksl!("Shaders/AlphaThreshold.ksl"),
+        ColorTargetDescriptor { format: session.format, blend: BlendState { enabled: false } }
+    )
+    let uniform = try sessionUniform(
+        session,
+        "renderbox-threshold-globals",
+        ThresholdDrawing.globalsFloatCount,
+        thresholdFloats(session, style, opacity)
+    )
+    let graphics = session.device.graphics()
+    let bindGroup = match graphics.beginBindGroup("renderbox-threshold") {
+        Ok(bindGroup) -> bindGroup
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    graphics.bindGroupAddUniform(bindGroup, ThresholdDrawing.globalsBinding, uniform)
+    graphics.bindGroupAddTexture(bindGroup, ThresholdDrawing.sourceBinding, source)
+    graphics.bindGroupAddSampler(bindGroup, ThresholdDrawing.samplerBinding, session.sampler)
+    session.bindGroups.append(copy bindGroup)
+    let draw = RecordedDraw {
+        pipeline: pipeline,
+        bindGroup: bindGroup,
+        vertexCount: ThresholdDrawing.vertexCount
+    }
+    try drawPass(session, target, Surfaces.transparent, [draw])
+    return .Ok((target, 1))
+}
+
+// render_'s globals: the colour, premultiplied at the opacity; the map that
+// takes `low` to 0 and `high` to 1, or a scale of one with no high end; the
+// channel; and the pixels the layer is read within.
+function thresholdFloats(
+    session: borrow RenderSession,
+    style: borrow AlphaThresholdStyle,
+    opacity: Number
+) -> [Number] {
+    let color = premultiplied(style.color, opacity)
+    let (scale, bounded) = match style.high {
+        Some(high) -> (1 / (high - style.low), 1)
+        None -> (1, 0)
+    }
+    let width = Number(session.width)
+    let height = Number(session.height)
+    return [
+        color.r, color.g, color.b, color.a, scale, -style.low * scale,
+        Number(code(style.component)), bounded, 0.5, 0.5, width - 0.5, height - 0.5, 1 / width,
+        1 / height, 0, 0
+    ]
+}

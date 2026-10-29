@@ -1,0 +1,203 @@
+import Foundation
+
+// RB::Path::Accumulator's buffer from the flattened segments. When no segment
+// is drawn as more than one line it holds points (convert_to_lines);
+// otherwise cubic records of eight words, after a header record of the
+// record count and the line count. A subpath starts with a marker record
+// whose controls are infinite and whose end is the subpath's start, written
+// when the buffer is empty or the segment does not start where the last one
+// ended.
+function segmentBuffer(segments: borrow [FlattenedCubic]) -> SegmentBuffer {
+    var longest: Number = 0
+    for segment in segments {
+        longest = max(longest, segment.lines)
+    }
+    if longest > 1 {
+        return cubicBuffer(segments)
+    }
+    return lineBuffer(segments)
+}
+
+namespace SegmentRecord {
+    // The words of one RB::Shader::Path::CubicSegment.
+    let words: Number = 8
+}
+
+// What a buffer collects while it is filled: its words after the header,
+// the records or points they hold and the bounds of the curves they draw.
+struct BufferBuilder {
+    var words: [UN32] = []
+    var entries: Number = 0
+    var lines: Number = 0
+    var low: Point = Point()
+    var high: Point = Point()
+    var empty: Bool = true
+}
+
+extend BufferBuilder {
+    // A point stored and kept in the bounds.
+    function point(borrow mut self, at: borrow Point) {
+        control(at)
+        include(at)
+    }
+
+    // A point stored but left out of the bounds: a cubic's control.
+    function control(borrow mut self, at: borrow Point) {
+        words.append(floatWord(at.x))
+        words.append(floatWord(at.y))
+    }
+
+    function include(borrow mut self, at: borrow Point) {
+        if empty {
+            low = copy at
+            high = copy at
+            empty = false
+            return
+        }
+        low = Point { x: min(low.x, at.x), y: min(low.y, at.y) }
+        high = Point { x: max(high.x, at.x), y: max(high.y, at.y) }
+    }
+
+    function breakPair(borrow mut self) {
+        words.append(Flattening.breakBits)
+        words.append(Flattening.breakBits)
+    }
+
+    function bounds() -> Rect {
+        return Rect { x: low.x, y: low.y, width: high.x - low.x, height: high.y - low.y }
+    }
+
+    // Whether `segment` starts a subpath: nothing is stored yet, or the
+    // last segment ended elsewhere.
+    function startsSubpath(segment: borrow FlattenedCubic, last: borrow Point) -> Bool {
+        return entries == 0 || !samePoint(segment.start, last)
+    }
+}
+
+// Points: a header pair whose first float is the count of points after it
+// less one, then every point, an infinite pair between subpaths.
+function lineBuffer(segments: borrow [FlattenedCubic]) -> SegmentBuffer {
+    var builder = BufferBuilder()
+    var last = Point()
+    for segment in segments {
+        if builder.startsSubpath(segment, last) {
+            if builder.entries > 0 {
+                builder.breakPair()
+                builder.entries += 1
+            }
+            builder.point(segment.start)
+            builder.entries += 1
+        }
+        builder.point(segment.end)
+        builder.entries += 1
+        last = copy segment.end
+    }
+    let edges = max(builder.entries - 1, 0)
+    var words: [UN32] = [floatWord(edges), floatWord(0)]
+    words.appendAll(builder.words)
+    // The shader reads the points through whole records.
+    while words.count % SegmentRecord.words != 0 {
+        words.append(0)
+    }
+    return SegmentBuffer { words: words, lines: true, edges: edges, bounds: builder.bounds() }
+}
+
+function cubicBuffer(segments: borrow [FlattenedCubic]) -> SegmentBuffer {
+    var builder = BufferBuilder()
+    var last = Point()
+    for segment in segments {
+        if builder.startsSubpath(segment, last) {
+            builder.words.append(floatWord(builder.lines))
+            builder.words.append(floatWord(0))
+            builder.breakPair()
+            builder.breakPair()
+            builder.point(segment.start)
+            builder.entries += 1
+        }
+        builder.words.append(floatWord(builder.lines))
+        builder.words.append(floatWord(1 / segment.lines))
+        builder.control(segment.firstControl)
+        builder.control(segment.secondControl)
+        builder.point(segment.end)
+        for turn in cubicTurns(segment) {
+            builder.include(turn)
+        }
+        builder.entries += 1
+        builder.lines += segment.lines
+        last = copy segment.end
+    }
+    var words: [UN32] = [floatWord(builder.entries), floatWord(builder.lines)]
+    while words.count < SegmentRecord.words {
+        words.append(0)
+    }
+    words.appendAll(builder.words)
+    return SegmentBuffer {
+        words: words,
+        lines: false,
+        edges: builder.lines,
+        bounds: builder.bounds()
+    }
+}
+
+// A number as the shader reads it: a 32-bit float's bits.
+function floatWord(value: Number) -> UN32 {
+    return UN32(floatToBits32(F32(value)))
+}
+
+// RB::Path::cubic_bounds_slow: the points inside a cubic where it turns back
+// along x or y. RB::Path::BoundingRect bounds a path by these and its
+// segments' ends, not by their controls, and Renderer::resolve takes every
+// edge's right end, the plane and the interior's pivot from those bounds.
+function cubicTurns(segment: borrow FlattenedCubic) -> [Point] {
+    var turns: [Point] = []
+    let along = [
+        axisTurns(segment.start.x, segment.firstControl.x, segment.secondControl.x, segment.end.x),
+        axisTurns(segment.start.y, segment.firstControl.y, segment.secondControl.y, segment.end.y)
+    ]
+    for times in along {
+        for t in times {
+            turns.append(cubicPoint(segment, t))
+        }
+    }
+    return turns
+}
+
+// The t strictly inside the cubic where one coordinate's derivative,
+// 3(a t² + b t + c), is zero.
+function axisTurns(p0: Number, p1: Number, p2: Number, p3: Number) -> [Number] {
+    let a = p3 - 3 * p2 + 3 * p1 - p0
+    let b = 2 * (p0 - 2 * p1 + p2)
+    let c = p1 - p0
+    var roots: [Number] = []
+    if a == 0 {
+        if b != 0 {
+            roots.append(-c / b)
+        }
+    } else {
+        let discriminant = b * b - 4 * a * c
+        if discriminant >= 0 {
+            let root = sqrt(discriminant)
+            roots.append((-b + root) / (2 * a))
+            roots.append((-b - root) / (2 * a))
+        }
+    }
+    var inside: [Number] = []
+    for t in roots {
+        if t > 0 && t < 1 {
+            inside.append(t)
+        }
+    }
+    return inside
+}
+
+function cubicPoint(segment: borrow FlattenedCubic, t: Number) -> Point {
+    let u = 1 - t
+    let w0 = u * u * u
+    let w1 = 3 * u * u * t
+    let w2 = 3 * u * t * t
+    let w3 = t * t * t
+    return Point {
+        x: w0 * segment.start.x + w1 * segment.firstControl.x + w2 * segment.secondControl.x + w3 * segment.end.x,
+        y: w0 * segment.start.y + w1 * segment.firstControl.y + w2 * segment.secondControl.y + w3 * segment.end.y
+    }
+}

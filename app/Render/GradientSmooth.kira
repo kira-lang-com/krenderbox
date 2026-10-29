@@ -1,0 +1,64 @@
+import Foundation
+
+// RB::Fill::smooth_color_coefficients: the segment from `index` to the next
+// stop as a cubic through both, its tangents the mean of the neighbouring
+// differences, zero where the colour turns and held to three times either
+// difference so it never overshoots. Stored as halves, constant term first.
+function smoothSegment(colors: borrow [RGBAColor], index: Number, mirrored: Bool) -> [Number] {
+    let entries = colors.count - 1
+    let current = colors[index]
+    let next = colors[index + 1]
+    var before = copy current
+    if index > 0 {
+        before = copy colors[index - 1]
+    } else if mirrored {
+        before = copy next
+    }
+    // set_gradient_color's lambda reads the stop after next only while it
+    // is one of the entries before the last stop.
+    var after = mirrored ? copy current : copy next
+    if index + 2 < entries {
+        after = copy colors[index + 2]
+    }
+    var words: [Number] = []
+    let channels = [
+        cubicCoefficients(before.r, current.r, next.r, after.r),
+        cubicCoefficients(before.g, current.g, next.g, after.g),
+        cubicCoefficients(before.b, current.b, next.b, after.b),
+        cubicCoefficients(before.a, current.a, next.a, after.a)
+    ]
+    for term in 0..4 {
+        for channel in channels {
+            words.append(halfRounded(channel[term]))
+        }
+    }
+    return words
+}
+
+// One channel's cubic between `p1` and `p2`.
+function cubicCoefficients(p0: Number, p1: Number, p2: Number, p3: Number) -> [Number] {
+    let d0 = p1 - p0
+    let d1 = p2 - p1
+    let d2 = p3 - p2
+    let m1 = limitedTangent(d0, d1)
+    let m2 = limitedTangent(d1, d2)
+    let first = p1 + m1 / 3
+    let second = p2 - m2 / 3
+    return [p1, m1, 3 * (p1 - 2 * first + second), d1 + 3 * (first - second)]
+}
+
+// The mean of two differences, zero when they differ in sign, no larger
+// than three times the first, then than three times the second.
+function limitedTangent(early: Number, late: Number) -> Number {
+    var tangent = (early + late) / 2
+    if (early < 0) != (late < 0) {
+        tangent = 0
+    }
+    if abs(tangent) > abs(3 * early) {
+        tangent = 3 * early
+    }
+    if abs(tangent) > abs(3 * late) {
+        tangent = 3 * late
+    }
+    return tangent
+}

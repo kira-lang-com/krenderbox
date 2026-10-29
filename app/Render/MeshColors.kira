@@ -1,0 +1,171 @@
+import Foundation
+
+// RB::Fill::MeshGradient::ColorConversion: the mesh's colours as its
+// interpolation runs them.
+function meshColorConversion(
+    session: borrow RenderSession,
+    mesh: borrow MeshGradient,
+    opacity: Number
+) -> Result<InterpolationConversion, RenderFailure> {
+    return interpolationConversion(session, mesh.colorSpace, mesh.interpolation, opacity)
+}
+
+// make_grid_color: the cell from (x, y)'s corner colours, or, when colour
+// runs along cubics, its colour tensor in the shader's layout.
+function gridColors(
+    mesh: borrow MeshGradient,
+    colors: borrow [RGBAColor],
+    x: Number,
+    y: Number
+) -> [RGBAColor] {
+    let corners = [
+        gridColor(mesh, colors, x, y), gridColor(mesh, colors, x, y + 1),
+        gridColor(mesh, colors, x + 1, y), gridColor(mesh, colors, x + 1, y + 1)
+    ]
+    if !mesh.smooth {
+        return corners
+    }
+    var tensor: [RGBAColor] = []
+    for index in 0..16 {
+        tensor.append(copy corners[cornerSlot(nearestCorner(index))])
+    }
+    // Each corner's colour a third of its tangent along u, then along v,
+    // towards the cell's middle.
+    let alongU = [4, 7, 8, 11]
+    let alongV = [1, 2, 13, 14]
+    for corner in 0..4 {
+        let cx = x + trunc(corner / 2)
+        let cy = y + corner % 2
+        let u = gridTangent(mesh, colors, cx, cy, 1, 0)
+        let v = gridTangent(mesh, colors, cx, cy, 0, 1)
+        let towardsU = corner < 2 ? 1 : -1
+        let towardsV = corner % 2 == 0 ? 1 : -1
+        tensor[alongU[corner]] = halfColor(colorPlus(corners[corner], colorScaled(u, towardsU / 3)))
+        tensor[alongV[corner]] = halfColor(colorPlus(corners[corner], colorScaled(v, towardsV / 3)))
+    }
+    return powerColumns(colorCoonsInterior(tensor))
+}
+
+function gridColor(
+    mesh: borrow MeshGradient,
+    colors: borrow [RGBAColor],
+    x: Number,
+    y: Number
+) -> RGBAColor {
+    return copy colors[y * mesh.width + x]
+}
+
+// The colour's tangent at (x, y) one step along (dx, dy), channel by
+// channel as a smooth gradient's: the mean of the steps either side, none
+// where they turn, at most three times either. A missing neighbour is the
+// point's own colour.
+function gridTangent(
+    mesh: borrow MeshGradient,
+    colors: borrow [RGBAColor],
+    x: Number,
+    y: Number,
+    dx: Number,
+    dy: Number
+) -> RGBAColor {
+    let here = gridColor(mesh, colors, x, y)
+    var before = copy here
+    if x - dx >= 0 && y - dy >= 0 {
+        before = gridColor(mesh, colors, x - dx, y - dy)
+    }
+    var after = copy here
+    if x + dx < mesh.width && y + dy < mesh.height() {
+        after = gridColor(mesh, colors, x + dx, y + dy)
+    }
+    let early = colorMinus(here, before)
+    let late = colorMinus(after, here)
+    return RGBAColor {
+        r: limitedTangent(early.r, late.r),
+        g: limitedTangent(early.g, late.g),
+        b: limitedTangent(early.b, late.b),
+        a: limitedTangent(early.a, late.a)
+    }
+}
+
+function colorPlus(a: borrow RGBAColor, b: borrow RGBAColor) -> RGBAColor {
+    return RGBAColor { r: a.r + b.r, g: a.g + b.g, b: a.b + b.b, a: a.a + b.a }
+}
+
+function colorMinus(a: borrow RGBAColor, b: borrow RGBAColor) -> RGBAColor {
+    return RGBAColor { r: a.r - b.r, g: a.g - b.g, b: a.b - b.b, a: a.a - b.a }
+}
+
+function colorScaled(a: borrow RGBAColor, scale: Number) -> RGBAColor {
+    return RGBAColor { r: a.r * scale, g: a.g * scale, b: a.b * scale, a: a.a * scale }
+}
+
+// x + y, x - y, x scaled and k x + y, each rounded once to halves as
+// commit_patch's half vector steps.
+function halfSum(x: borrow RGBAColor, y: borrow RGBAColor) -> RGBAColor {
+    return halfColor(colorPlus(x, y))
+}
+
+function halfDifference(x: borrow RGBAColor, y: borrow RGBAColor) -> RGBAColor {
+    return halfColor(colorMinus(x, y))
+}
+
+function halfScaled(x: borrow RGBAColor, k: Number) -> RGBAColor {
+    return halfColor(colorScaled(x, k))
+}
+
+function halfFused(k: Number, x: borrow RGBAColor, y: borrow RGBAColor) -> RGBAColor {
+    return halfColor(colorPlus(colorScaled(x, k), y))
+}
+
+namespace MeshCoons {
+    // The half commit_patch divides by nine with, 0x2f1c.
+    let ninth: Number = 0.111083984375
+}
+
+// commit_patch's Coons interior for the colour tensor, in halves: the
+// point nearest each corner from -4 the corner, 6 its neighbours, -2 the
+// far corners, 3 the edge points across and less the opposite corner,
+// then a ninth.
+function colorCoonsInterior(tensor: borrow [RGBAColor]) -> [RGBAColor] {
+    var filled = copy tensor
+    for (i, j) in [(1, 1), (1, 2), (2, 1), (2, 2)] {
+        let ci = i == 1 ? 0 : 3
+        let cj = j == 1 ? 0 : 3
+        let far = halfScaled(
+            halfSum(tensorAt(tensor, ci, 3 - cj), tensorAt(tensor, 3 - ci, cj)),
+            -2
+        )
+        let near = halfSum(tensorAt(tensor, i, cj), tensorAt(tensor, ci, j))
+        let across = halfSum(tensorAt(tensor, 3 - ci, j), tensorAt(tensor, i, 3 - cj))
+        let opposite = tensorAt(tensor, 3 - ci, 3 - cj)
+        var mixed = halfFused(-4, tensorAt(tensor, ci, cj), colorScaled(opposite, -1))
+        mixed = halfSum(mixed, far)
+        if ci == 0 {
+            mixed = halfFused(3, across, halfFused(6, near, mixed))
+        } else {
+            mixed = halfFused(6, near, halfFused(3, across, mixed))
+        }
+        filled[tensorIndex(i, j)] = halfScaled(mixed, MeshCoons.ninth)
+    }
+    return filled
+}
+
+function tensorAt(tensor: borrow [RGBAColor], row: Number, column: Number) -> RGBAColor {
+    return copy tensor[tensorIndex(row, column)]
+}
+
+// Each row of the colour tensor, a cubic in v, from Bezier to power form
+// in halves: a, 3 (b - a), 3 ((a - 2 b) + c), 3 (b - c) + (d - a).
+function powerColumns(tensor: borrow [RGBAColor]) -> [RGBAColor] {
+    var power: [RGBAColor] = []
+    for i in 0..4 {
+        let a = tensor[tensorIndex(i, 0)]
+        let b = tensor[tensorIndex(i, 1)]
+        let c = tensor[tensorIndex(i, 2)]
+        let d = tensor[tensorIndex(i, 3)]
+        power.append(copy a)
+        power.append(halfScaled(halfDifference(b, a), 3))
+        power.append(halfScaled(halfSum(halfDifference(a, colorScaled(b, 2)), c), 3))
+        power.append(halfFused(3, halfDifference(b, c), halfDifference(d, a)))
+    }
+    return power
+}

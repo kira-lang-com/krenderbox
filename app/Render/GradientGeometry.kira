@@ -1,0 +1,176 @@
+import Foundation
+
+// RB::Fill::Gradient::set_gradient_geometry: the map from device pixels into
+// the gradient's own space, where Gradient::value reads its position, and the
+// three parameters that go with it. RenderBox maps from clip space; this maps
+// from device pixels, which the fragment has to hand.
+struct GradientGeometryGlobals {
+    var toGradient: AffineTransform = AffineTransform()
+    var first: Number = 0
+    var second: Number = 0
+    var swapped: Bool = false
+}
+
+namespace GradientGeometryConstants {
+    // The least difference set_gradient_geometry divides radii by.
+    let radiusDifference: Number = 0.0078125
+    // Below this |r^2 - 1| a two-point gradient's circles are tangent.
+    let tangentLimit: Number = 0.0001
+    let pi: Number = 3.1415927
+    let twoPi: Number = 6.2831855
+    let inverseTwoPi: Number = 0.15915494
+    let inverseFourPi: Number = 0.07957747
+}
+
+// angular_location_function's constants, which it works in doubles.
+namespace ArcTurn {
+    let twoPi: Number = 6.283185307179586
+    let inverseTwoPi: Number = 0.15915494309189535
+    let inverseFourPi: Number = 0.07957747154594767
+}
+
+// The gradient's code, RenderState bits 19 to 22: the table at 0x1b32884e0,
+// by geometry and edge mode. Two radial circles not sharing a centre have
+// their own row.
+namespace GradientKinds {
+    let table: [Number] = [0, 1, 2, 7, 3, 4, 5, 8, 6, 6, 6, 6, 13, 14, 15, 13, 9, 10, 11, 12]
+    let rowLength: Number = 4
+    let twoPointRow: Number = 4
+}
+
+function gradientKind(gradient: borrow Gradient) -> Number {
+    let row: Number = match gradient.geometry {
+        Axial(axial) -> 0
+        Radial(radial) -> samePoint(
+            radial.startCenter,
+            radial.endCenter
+        ) ? 1 : GradientKinds.twoPointRow
+        Conic(conic) -> 2
+        Alpha -> 3
+        Angular(angular) -> 2
+    }
+    return GradientKinds.table[row * GradientKinds.rowLength + Number(code(gradient.edgeMode))]
+}
+
+// The geometry for `gradient` drawn through `transform`; nothing for the
+// alpha gradient, which reads the shape's own alpha and is not ported.
+function gradientGeometry(
+    gradient: borrow Gradient,
+    transform: borrow AffineTransform
+) -> GradientGeometryGlobals? {
+    let toUser = match transform.inverted() {
+        Some(inverse) -> inverse
+        None -> return .None
+    }
+    return match gradient.geometry {
+        Axial(axial) -> .Some(axialGeometry(toUser, axial))
+        Radial(radial) -> .Some(radialGeometry(toUser, radial))
+        Conic(conic) -> .Some(conicGeometry(toUser, conic.center, conic.angle))
+        Alpha -> .None
+        Angular(angular) -> .Some(conicGeometry(toUser, angular.center, angularAngle(angular)))
+    }
+}
+
+// The axis from the start point is x, at one per its length.
+function axialGeometry(
+    toUser: borrow AffineTransform,
+    axial: borrow AxialGradient
+) -> GradientGeometryGlobals {
+    let along = Point {
+        x: axial.endPoint.x - axial.startPoint.x,
+        y: axial.endPoint.y - axial.startPoint.y
+    }
+    let mapped = toUser.concatenating(translation(axial.startPoint)).concatenating(axisMap(along))
+    return GradientGeometryGlobals { toGradient: mapped }
+}
+
+// The map turning `along` into (1, 0): a rotation scaled by one over its
+// squared length.
+function axisMap(along: borrow Point) -> AffineTransform {
+    let squared = along.x * along.x + along.y * along.y
+    return AffineTransform {
+        a: along.x / squared,
+        b: -along.y / squared,
+        c: along.y / squared,
+        d: along.x / squared
+    }
+}
+
+// Moves `origin` to the origin.
+function translation(origin: borrow Point) -> AffineTransform {
+    return AffineTransform { tx: -origin.x, ty: -origin.y }
+}
+
+// The angle wrapped as set_gradient_geometry wraps it; the position is the
+// turn from it.
+function conicGeometry(
+    toUser: borrow AffineTransform,
+    center: borrow Point,
+    start: Number
+) -> GradientGeometryGlobals {
+    let turns = trunc(floatRounded(start * GradientGeometryConstants.inverseTwoPi))
+    var angle = floatRounded(start - floatRounded(turns * GradientGeometryConstants.twoPi))
+    if angle > GradientGeometryConstants.pi {
+        angle = floatRounded(angle - GradientGeometryConstants.twoPi)
+    }
+    return GradientGeometryGlobals {
+        toGradient: toUser.concatenating(translation(center)),
+        first: floatRounded(-angle * GradientGeometryConstants.inverseTwoPi),
+        second: angle
+    }
+}
+
+// Where an angular gradient's turn starts: half a turn from the middle of
+// its arc, so the arc's ends meet opposite it; past a whole turn, its end
+// angle.
+function angularAngle(angular: borrow AngularGradient) -> Number {
+    let span = floatRounded(abs(angular.endAngle - angular.startAngle))
+    if span > GradientGeometryConstants.twoPi {
+        return angular.endAngle
+    }
+    let low = floatRounded(min(angular.startAngle, angular.endAngle) - GradientGeometryConstants.pi)
+    return floatRounded(low + floatRounded(span / 2))
+}
+
+// Gradient::angular_location_function: where the arc's stops lie in the
+// turn, as the start of their span and its length. An arc within a turn
+// sits centred on half a turn; a longer one ends at a whole turn. An arc
+// running backwards mirrors both.
+function angularLocations(angular: borrow AngularGradient) -> (Number, Number) {
+    let span = floatRounded(abs(angular.endAngle - angular.startAngle))
+    var low = floatRounded(1 - span * ArcTurn.inverseTwoPi)
+    var high: Number = 1
+    if span <= ArcTurn.twoPi {
+        low = floatRounded(0.5 - span * ArcTurn.inverseFourPi)
+        high = floatRounded(0.5 + span * ArcTurn.inverseFourPi)
+    }
+    if angular.startAngle > angular.endAngle {
+        low = floatRounded(1 - low)
+        high = floatRounded(1 - high)
+    }
+    return (low, floatRounded(high - low))
+}
+
+function radialGeometry(
+    toUser: borrow AffineTransform,
+    radial: borrow RadialGradient
+) -> GradientGeometryGlobals {
+    if !samePoint(radial.startCenter, radial.endCenter) {
+        return twoPointGeometry(toUser, radial)
+    }
+    let difference = guardedDifference(radial.startRadius - radial.endRadius)
+    return GradientGeometryGlobals {
+        toGradient: toUser.concatenating(translation(radial.startCenter)),
+        first: -1 / difference,
+        second: radial.startRadius / difference
+    }
+}
+
+// A difference of radii no smaller than RenderBox divides by, keeping its
+// sign.
+function guardedDifference(difference: Number) -> Number {
+    if abs(difference) >= GradientGeometryConstants.radiusDifference {
+        return difference
+    }
+    return difference < 0 ? -GradientGeometryConstants.radiusDifference : GradientGeometryConstants.radiusDifference
+}

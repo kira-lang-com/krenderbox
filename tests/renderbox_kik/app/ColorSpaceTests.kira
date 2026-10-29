@@ -1,0 +1,70 @@
+import Foundation
+import RenderBox
+
+function filledWhole(color: RGBAColor, space: ColorSpace) -> Result<[UN8], RenderFailure> {
+    let side = Number(RenderTarget.side)
+    var list = DisplayList()
+    var shape = Shape()
+    shape.setRect(Rect { width: side, height: side })
+    var fill = Fill()
+    fill.setColor(move color, space)
+    list.drawShape(shape, fill, 1, .Normal)
+    return renderLayer(
+        list.moveContents(),
+        RenderTarget.side,
+        RenderTarget.side,
+        RenderTarget.clear
+    )
+}
+
+// Half red in Display P3 is decoded through the table, taken to sRGB's
+// primaries and encoded again: 0.2158 linear, 0.2644 in sRGB's, 0.5513.
+@Test
+function displayP3ColorConvertsToThePass() {
+    expect!(displayP3ColorConvertsToThePassResult() == "141/255")
+}
+
+function displayP3ColorConvertsToThePassResult() -> String {
+    let half = RGBAColor { r: 0.5, g: 0, b: 0, a: 1 }
+    return sampled(filledWhole(move half, .DisplayP3), [Point { x: 4, y: 4 }])
+}
+
+// Gray to sRGB keeps the encoding and spreads the one channel.
+@Test
+function grayColorConvertsToThePass() {
+    expect!(grayColorConvertsToThePassResult() == "128/255")
+}
+
+function grayColorConvertsToThePassResult() -> String {
+    let gray = RGBAColor { r: 0.5, g: 0, b: 0, a: 1 }
+    return sampled(filledWhole(move gray, .Gray), [Point { x: 4, y: 4 }])
+}
+
+// A colour with no space is in the pass's already.
+@Test
+function deviceColorIsNotConverted() {
+    expect!(deviceColorIsNotConvertedResult() == "128/255")
+}
+
+function deviceColorIsNotConvertedResult() -> String {
+    let half = RGBAColor { r: 0.5, g: 0, b: 0, a: 1 }
+    return sampled(filledWhole(move half, .Device), [Point { x: 4, y: 4 }])
+}
+
+// Rec. 2100 PQ needs its transfer function, which is not ported.
+@Test
+function perceptualQuantizerIsUnported() {
+    expect!(perceptualQuantizerIsUnportedResult() == "unported")
+}
+
+function perceptualQuantizerIsUnportedResult() -> String {
+    let half = RGBAColor { r: 0.5, g: 0, b: 0, a: 1 }
+    let failure = match filledWhole(move half, .Rec2100PerceptualQuantizer) {
+        Ok(bytes) -> return "rendered"
+        Error(failure) -> failure
+    }
+    return match failure {
+        UnportedColorSpace -> "unported"
+        else -> "failed \(failure)"
+    }
+}

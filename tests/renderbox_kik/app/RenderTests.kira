@@ -1,0 +1,189 @@
+import Foundation
+import RenderBox
+
+// Every render test draws into this target over transparent black.
+namespace RenderTarget {
+    let side: UN32 = 8
+    let clear: RGBAColor = RGBAColor { r: 0, g: 0, b: 0, a: 0 }
+    let red: RGBAColor = RGBAColor { r: 1, g: 0, b: 0, a: 1 }
+}
+
+// `shape` filled with opaque red through `blend`, rendered on the GPU.
+function rendered(shape: borrow Shape, blend: BlendMode) -> Result<[UN8], RenderFailure> {
+    var list = DisplayList()
+    var fill = Fill()
+    fill.setColor(RenderTarget.red, .StandardRgb)
+    list.drawShape(shape, fill, 1, blend)
+    return renderLayer(
+        list.moveContents(),
+        RenderTarget.side,
+        RenderTarget.side,
+        RenderTarget.clear
+    )
+}
+
+// The red and alpha bytes of each pixel in `at`, as "red/alpha" words.
+function sampled(pixels: borrow Result<[UN8], RenderFailure>, at: borrow [Point]) -> String {
+    let bytes = match pixels {
+        Ok(bytes) -> bytes
+        Error(failure) -> return "failed \(failure)"
+    }
+    var words = ""
+    for point in at {
+        let index = (point.y * RenderTarget.side + point.x) * 4
+        let word = "\(bytes[index])/\(bytes[index + 3])"
+        words = words.count == 0 ? word : "\(words) \(word)"
+    }
+    return words
+}
+
+// A rect on whole pixels is written through: full inside, clear outside.
+@Test
+function integralRectFills() {
+    expect!(integralRectFillsResult() == "255/255 0/0 0/0")
+}
+
+function integralRectFillsResult() -> String {
+    var shape = Shape()
+    shape.setRect(Rect { x: 2, y: 2, width: 4, height: 4 })
+    let pixels = rendered(shape, .Normal)
+    return sampled(pixels, [Point { x: 3, y: 3 }, Point { x: 0, y: 0 }, Point { x: 6, y: 3 }])
+}
+
+// An antialiased edge through a pixel's centre covers half of it.
+@Test
+function rectEdgeCoversHalf() {
+    expect!(rectEdgeCoversHalfResult() == "255/255 128/128 0/0")
+}
+
+function rectEdgeCoversHalfResult() -> String {
+    var shape = Shape()
+    shape.setRect(Rect { x: 0, y: 0, width: 2.5, height: 8 })
+    let pixels = rendered(shape, .Normal)
+    return sampled(pixels, [Point { x: 1, y: 4 }, Point { x: 2, y: 4 }, Point { x: 3, y: 4 }])
+}
+
+// A rect under two and a half pixels wide covers each pixel by area.
+@Test
+function pixelRectCoversArea() {
+    expect!(pixelRectCoversAreaResult() == "255/255 64/64 0/0")
+}
+
+function pixelRectCoversAreaResult() -> String {
+    var shape = Shape()
+    shape.setRect(Rect { x: 1, y: 0, width: 1.25, height: 8 })
+    let pixels = rendered(shape, .Normal)
+    return sampled(pixels, [Point { x: 1, y: 4 }, Point { x: 2, y: 4 }, Point { x: 0, y: 4 }])
+}
+
+@Test
+function circleFillsItsMiddle() {
+    expect!(circleFillsItsMiddleResult() == "255/255 255/255 0/0")
+}
+
+function circleFillsItsMiddleResult() -> String {
+    var shape = Shape()
+    shape.setCircle(Point { x: 4, y: 4 }, 3)
+    let pixels = rendered(shape, .Normal)
+    return sampled(pixels, [Point { x: 4, y: 4 }, Point { x: 3, y: 3 }, Point { x: 0, y: 0 }])
+}
+
+// A closed square of lines on `rect`'s corners, clockwise.
+function squarePath(rect: borrow Rect) -> Path {
+    return Path()
+    .move (Point { x: rect.minX(), y: rect.minY() })
+    .line(Point { x: rect.maxX(), y: rect.minY() })
+    .line(Point { x: rect.maxX(), y: rect.maxY() })
+    .line(Point { x: rect.minX(), y: rect.maxY() })
+    .closed()
+}
+
+// A path of lines on whole pixels covers its inside fully and nothing else.
+@Test
+function linePathFills() {
+    expect!(linePathFillsResult() == "255/255 255/255 0/0 0/0")
+}
+
+function linePathFillsResult() -> String {
+    var shape = Shape()
+    shape.setPath(squarePath(Rect { x: 2, y: 2, width: 4, height: 4 }), AffineTransform())
+    let pixels = rendered(shape, .Normal)
+    return sampled(
+        pixels,
+        [Point { x: 3, y: 3 }, Point { x: 5, y: 5 }, Point { x: 1, y: 3 }, Point { x: 6, y: 6 }]
+    )
+}
+
+// An edge through a pixel's centre covers half of it, with no closing
+// element: the fill closes the subpath.
+@Test
+function pathEdgeCoversHalf() {
+    expect!(pathEdgeCoversHalfResult() == "255/255 255/255 128/128 0/0")
+}
+
+function pathEdgeCoversHalfResult() -> String {
+    let path = Path()
+    .move (Point { x: 0, y: 0 })
+    .line(Point { x: 2.5, y: 0 })
+    .line(Point { x: 2.5, y: 8 })
+    .line(Point { x: 0, y: 8 })
+    var shape = Shape()
+    shape.setPath(move path, AffineTransform())
+    let pixels = rendered(shape, .Normal)
+    return sampled(
+        pixels,
+        [Point { x: 0, y: 7 }, Point { x: 1, y: 4 }, Point { x: 2, y: 4 }, Point { x: 3, y: 4 }]
+    )
+}
+
+// Two squares wound the same way: the inner one is covered twice, which the
+// non-zero rule fills and the even-odd rule leaves empty.
+function nestedSquares(evenOdd: Bool) -> String {
+    let outer = squarePath(Rect { x: 1, y: 1, width: 6, height: 6 })
+    var path = squarePath(Rect { x: 3, y: 3, width: 2, height: 2 })
+    for element in outer.elements {
+        path = path.appending(copy element)
+    }
+    var shape = Shape()
+    shape.setPath(move path, AffineTransform())
+    shape.setEvenOddFill(evenOdd)
+    let pixels = rendered(shape, .Normal)
+    return sampled(pixels, [Point { x: 4, y: 4 }, Point { x: 2, y: 2 }, Point { x: 0, y: 0 }])
+}
+
+@Test
+function nonZeroFillsOverlap() {
+    expect!(nonZeroFillsOverlapResult() == "255/255 255/255 0/0")
+}
+
+function nonZeroFillsOverlapResult() -> String { return nestedSquares(false) }
+
+@Test
+function evenOddEmptiesOverlap() {
+    expect!(evenOddEmptiesOverlapResult() == "0/0 255/255 0/0")
+}
+
+function evenOddEmptiesOverlapResult() -> String { return nestedSquares(true) }
+
+// A circle of four cubics is flattened into many lines a segment, so it goes
+// through the cubic records: full in the middle, clear in the corners.
+@Test
+function cubicPathFills() {
+    expect!(cubicPathFillsResult() == "255/255 255/255 0/0")
+}
+
+function cubicPathFillsResult() -> String {
+    // The control distance of a quarter circle of radius 3.
+    let k = 1.65685424949238
+    let path = Path()
+    .move (Point { x: 7, y: 4 })
+    .cubic(Point { x: 4, y: 7 }, Point { x: 7, y: 4 + k }, Point { x: 4 + k, y: 7 })
+    .cubic(Point { x: 1, y: 4 }, Point { x: 4 - k, y: 7 }, Point { x: 1, y: 4 + k })
+    .cubic(Point { x: 4, y: 1 }, Point { x: 1, y: 4 - k }, Point { x: 4 - k, y: 1 })
+    .cubic(Point { x: 7, y: 4 }, Point { x: 4 + k, y: 1 }, Point { x: 7, y: 4 - k })
+    .closed()
+    var shape = Shape()
+    shape.setPath(move path, AffineTransform())
+    let pixels = rendered(shape, .Normal)
+    return sampled(pixels, [Point { x: 4, y: 4 }, Point { x: 3, y: 3 }, Point { x: 0, y: 0 }])
+}

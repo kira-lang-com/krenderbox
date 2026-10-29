@@ -1,0 +1,127 @@
+import Foundation
+
+// GenericItem<Primitive, Color>::copy_shadow then
+// ShadowStyle::make_primitive: a filled primitive casts a primitive of its
+// own, its edge blurred, painted the shadow's colour and moved by the offset.
+// None where a blurred layer draws the shadow instead. A gradient, image or
+// shader fill's own copy_shadow, a clip the blur might reach past, and an
+// uneven midpoint's alpha gradient are not ported.
+function primitiveShadow(
+    item: borrow Item,
+    shadow: borrow ShadowStyle,
+    state: borrow DrawingState,
+    alpha: Number
+) -> Result<Item?, RenderFailure> {
+    let shape = match item {
+        Shape(shape) -> shape
+        Layer(layer) -> return .Ok(.None)
+    }
+    let primitive = try snapshotPrimitive(shape.shape) otherwise return .Ok(.None)
+    let fill = match shape.fill {
+        Color(fill) -> fill
+        Gradient(gradient) -> return .Error(.UnportedStyle)
+        Image(image) -> return .Error(.UnportedStyle)
+        Shader(fill) -> return .Error(.UnportedStyle)
+        MeshGradient(mesh) -> return .Error(.UnportedStyle)
+    }
+    if shadow.flags.has(ShadowFlags.dither) {
+        return .Ok(.None)
+    }
+    if state.clips.count > 0 || shadow.midpoint != ShadowDrawing.evenMidpoint {
+        return .Error(.UnportedStyle)
+    }
+    let fromItem = try state.transform.inverted() otherwise copy state.transform
+    let toItem = shadow.transform.concatenating(fromItem)
+    let inverse = shadow.flags.has(ShadowFlags.inverseAlpha)
+    let cast = try shadowedPrimitive(
+        primitive,
+        toItem,
+        shadow.radius,
+        inverse
+    ) otherwise return .Ok(.None)
+    let castItem = castShapeItem(shape, cast, shadow, state, alpha)
+    return .Ok(.Some(.Shape(castItem)))
+}
+
+// The cast primitive as an item: the shadow's colour at the cast's alpha,
+// moved by the shadow's offset.
+function castShapeItem(
+    shape: borrow ShapeItem,
+    cast: borrow ShadowedPrimitive,
+    shadow: borrow ShadowStyle,
+    state: borrow DrawingState,
+    alpha: Number
+) -> ShapeItem {
+    let color = copy shadow.color
+    let painted = RGBAColor { r: color.r, g: color.g, b: color.b, a: color.a * cast.alpha }
+    let snapshot = ShapeSnapshot {
+        data: .Primitive(copy cast.primitive),
+        fillRule: shape.shape.fillRule,
+        renderingMode: cast.primitive.renderingMode,
+        renderingModeArgument: cast.primitive.renderingModeArgument
+    }
+    var moved = copy state
+    moved.transform = state.transform.concatenating(shadowOffset(shadow))
+    return ShapeItem {
+        shape: snapshot,
+        fill: .Color(ColorFill { color: painted, colorSpace: shadow.colorSpace }),
+        headroom: shadow.headroom,
+        alpha: alpha,
+        blendMode: shadow.blendMode,
+        state: moved
+    }
+}
+
+// The shadow as ShadowStyle::draw makes it of anything else: a copy of the
+// item, through its own blend no more, blurred by the radius in the
+// shadow's space, then ColorMatrix::set_alpha_multiply paints every pixel
+// the shadow's colour at the shadow's alpha times its own, or times what it
+// lacks for an inverse shadow, and the whole moved by the offset.
+function layerShadow(
+    item: borrow Item,
+    shadow: borrow ShadowStyle,
+    state: borrow DrawingState,
+    alpha: Number
+) -> Result<Item, RenderFailure> {
+    let even = abs(shadow.midpoint - ShadowDrawing.evenMidpoint) < ShadowDrawing.midpointTolerance
+    // The copy keeps the clips after the shadow, moved with it, and the
+    // shadow takes those before; splitting them is not ported.
+    if !even || shadow.flags.has(ShadowFlags.dither) || state.clips.count > 0 {
+        return .Error(.UnportedStyle)
+    }
+    let copied = restated(item, copy state, alpha, .Normal)
+    var styles: [Style] = [.ColorMatrix(alphaMultiply(shadow))]
+    if abs(shadow.radius) > ShadowDrawing.smallestRadius {
+        let (scaleX, scaleY) = shadow.transform.axisScales()
+        let radius = Vector2 { x: shadow.radius * scaleX, y: shadow.radius * scaleY }
+        styles.append(.Blur(BlurStyle { radius: radius, flags: BlurFlags.none }))
+    }
+    let counts: [UNumber] = styles.count == 1 ? [0] : [0, 0]
+    let contents = LayerContents { items: [copied] }
+    let moved = try transformedContents(contents, shadowOffset(shadow), 1) otherwise return .Error(
+        .UnportedStyle
+    )
+    let layer = LayerItem {
+        contents: moved,
+        alpha: 1,
+        blendMode: shadow.blendMode,
+        state: DrawingState {
+            transform: copy state.transform,
+            styles: styles,
+            styleClipCounts: counts,
+            contentHeadroom: state.contentHeadroom
+        }
+    }
+    return .Ok(.Layer(layer))
+}
+
+// ColorMatrix::set_alpha_multiply and set_inverse_alpha_multiply on colours
+// not premultiplied: the colour itself, at its alpha times the pixel's or
+// times one less the pixel's.
+function alphaMultiply(shadow: borrow ShadowStyle) -> ColorMatrixStyle {
+    let inverse = shadow.flags.has(ShadowFlags.inverseAlpha)
+    return ColorMatrixStyle {
+        matrix: alphaMultiplyMatrix(shadow.color, false, inverse),
+        flags: ColorFilterFlags.none
+    }
+}

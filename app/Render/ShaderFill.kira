@@ -1,0 +1,263 @@
+import Foundation
+import Ember
+
+// How a shader function runs. RenderBox stitches a Metal function into its
+// fill shader; a KSL function is a whole shader of its own, drawn over the
+// target in a pass before the shape, which then samples what it wrote.
+//
+// The contract a library's KSL shader keeps:
+// - `group Draw` holds `uniform arguments` first, then, for each image
+//   argument in order, its `texture` and its `sampler`.
+// - The uniform's struct starts with `toUser: Float4` and
+//   `toUserTranslation: Float2`, device pixel to the point being shaded:
+//   x * toUser.xy + y * toUser.zw + toUserTranslation.
+// - Then one field per argument, in argument order, laid out as WGSL lays a
+//   uniform out: a float, float2, float3 or float4 at its own alignment, a
+//   colour as a premultiplied float4, a mipmapped image as a float2 holding
+//   one over its size in pixels, so the shader can sample it at a pixel
+//   position. A plain image also hands RenderBox's shader its transform,
+//   which is not decoded yet, so it is refused.
+// - The vertex stage draws three vertices over the whole target; the
+//   fragment returns the function's premultiplied colour.
+namespace ShaderFillDrawing {
+    let group: UN32 = 0
+    let argumentsBinding: UN32 = 0
+    let firstImageBinding: UN32 = 1
+    let vertexCount: UN32 = 3
+    // WGSL's uniform alignments, in floats.
+    let scalarAlignment: Number = 1
+    let pairAlignment: Number = 2
+    let quadAlignment: Number = 4
+    let tripleSize: Number = 3
+}
+
+public enum ShaderFillFailure {
+    // The library has no function by the shader's name.
+    MissingFunction(String)
+    // An argument index below the last was never set.
+    UnsetArgument(UNumber)
+}
+
+// A shader function's arguments as a uniform's floats and the images bound
+// after it.
+struct PackedArguments {
+    var floats: [Number] = []
+    var images: [TextureImage] = []
+}
+
+function padded(floats: borrow mut [Number], alignment: Number) {
+    while floats.count % alignment != 0 {
+        floats.append(0)
+    }
+}
+
+function packed(
+    session: borrow mut RenderSession,
+    shader: borrow Shader,
+    toUser: borrow AffineTransform
+) -> Result<PackedArguments, RenderFailure> {
+    return packedAfter(session, shader, PackedArguments { floats: userFloats(toUser) })
+}
+
+function userFloats(toUser: borrow AffineTransform) -> [Number] {
+    return [toUser.a, toUser.b, toUser.c, toUser.d, toUser.tx, toUser.ty]
+}
+
+// The shader's arguments packed after what `start` already holds.
+function packedAfter(
+    session: borrow mut RenderSession,
+    shader: borrow Shader,
+    start: PackedArguments
+) -> Result<PackedArguments, RenderFailure> {
+    var result = start
+    for (index, argument) in shader.arguments.enumerated() {
+        let value = match argument {
+            Some(value) -> value
+            None -> return .Error(.ShaderFill(.UnsetArgument(index)))
+        }
+        match packArgument(session, result, value, index) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+    }
+    padded(result.floats, ShaderFillDrawing.quadAlignment)
+    return .Ok(result)
+}
+
+function packArgument(
+    session: borrow mut RenderSession,
+    into: borrow mut PackedArguments,
+    argument: borrow ShaderArgument,
+    index: UNumber
+) -> Result<Void, RenderFailure> {
+    match argument {
+        Float(value) -> appendAligned(into.floats, [value], ShaderFillDrawing.scalarAlignment)
+        Float2(value) -> appendAligned(
+            into.floats,
+            [value.x, value.y],
+            ShaderFillDrawing.pairAlignment
+        )
+        Float3(value) -> appendAligned(
+            into.floats,
+            [value.x, value.y, value.z],
+            ShaderFillDrawing.quadAlignment
+        )
+        Float4(value) -> appendAligned(
+            into.floats,
+            [value.x, value.y, value.z, value.w],
+            ShaderFillDrawing.quadAlignment
+        )
+        Color(color) -> appendAligned(
+            into.floats,
+            [color.r * color.a, color.g * color.a, color.b * color.a, color.a],
+            ShaderFillDrawing.quadAlignment
+        )
+        Image(image) -> return packImage(session, into, image)
+        MipmappedImage(image) -> return packImage(session, into, image)
+    }
+    return .Ok
+}
+
+function appendAligned(floats: borrow mut [Number], values: borrow [Number], alignment: Number) {
+    padded(floats, alignment)
+    for value in values {
+        floats.append(value)
+    }
+}
+
+// An image argument: RenderBox hands the stitchable function the bare
+// texture, which it samples at a point in its own pixels (glassHighlight's
+// sample_texture_2d at the user point); a KSL port reads it at the point
+// times the inverse size packed here.
+function packImage(
+    session: borrow mut RenderSession,
+    into: borrow mut PackedArguments,
+    image: borrow Image
+) -> Result<Void, RenderFailure> {
+    let texture = try imageTexture(session, image)
+    let (width, height) = imageSize(image)
+    appendAligned(into.floats, [1 / width, 1 / height], ShaderFillDrawing.pairAlignment)
+    into.images.append(TextureImage { texture: texture, width: UN32(width), height: UN32(height) })
+    return .Ok
+}
+
+// RBFill's shader fill: the function run over the target at every pixel's
+// point in user space, as paint for the shape at `alpha`. RenderBox runs it
+// only inside `bounds`; the shape's coverage bounds it here.
+function shaderPaint(
+    session: borrow mut RenderSession,
+    fill: borrow ShaderFill,
+    transform: borrow AffineTransform,
+    alpha: Number
+) -> Result<Paint, RenderFailure> {
+    let toUser = match transform.inverted() {
+        Some(inverse) -> inverse
+        None -> return .Ok(.Solid(Surfaces.transparent))
+    }
+    let arguments = match packed(session, fill.shader, toUser) {
+        Ok(arguments) -> arguments
+        Error(failure) -> return .Error(failure)
+    }
+    let pipeline = match functionPipeline(session, fill.shader) {
+        Ok(pipeline) -> pipeline
+        Error(failure) -> return .Error(failure)
+    }
+    let bindGroup = match boundArguments(session, arguments) {
+        Ok(bindGroup) -> bindGroup
+        Error(failure) -> return .Error(failure)
+    }
+    let texture = match surface(session, "renderbox-shader-fill") {
+        Ok(texture) -> texture
+        Error(failure) -> return .Error(failure)
+    }
+    let draw = RecordedDraw {
+        pipeline: pipeline,
+        bindGroup: bindGroup,
+        vertexCount: ShaderFillDrawing.vertexCount
+    }
+    return match drawPass(session, texture, Surfaces.transparent, [draw]) {
+        Ok -> .Ok(surfacePaint(session, move texture, alpha))
+        Error(failure) -> .Error(failure)
+    }
+}
+
+// The function's pipeline, writing its colour through, made the first time a
+// fill asks for it.
+function functionPipeline(
+    session: borrow mut RenderSession,
+    shader: borrow Shader
+) -> Result<RenderPipeline, RenderFailure> {
+    let name = shader.functionName
+    for (served, pipeline) in session.functionPipelines {
+        if served == name {
+            return .Ok(copy pipeline)
+        }
+    }
+    let found = match shader.library.named(name) {
+        Some(found) -> found
+        None -> return .Error(.ShaderFill(.MissingFunction(copy name)))
+    }
+    let graphics = session.device.graphics()
+    let compiled = match graphics.createShaderFromKslArtifact(found.name, found.artifact) {
+        Ok(compiled) -> compiled
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.shaders.append(copy compiled)
+    let made = graphics.createRenderPipeline(
+        RenderPipelineDescriptor {
+            label: found.name,
+            shader: compiled,
+            colorTargets: [ColorTargetDescriptor {
+                format: session.format,
+                blend: BlendState { enabled: false }
+            }],
+            depthStencil: DepthStencilDescriptor { depthCompare: .Always }
+        }
+    )
+    let pipeline = match made {
+        Ok(pipeline) -> pipeline
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.functionPipelines.append((copy name, copy pipeline))
+    return .Ok(pipeline)
+}
+
+function boundArguments(
+    session: borrow mut RenderSession,
+    arguments: borrow PackedArguments
+) -> Result<BindGroup, RenderFailure> {
+    let graphics = session.device.graphics()
+    let made = graphics.createUniform(
+        UniformDescriptor {
+            label: "renderbox-shader-arguments",
+            expectedFloatCount: UN32(arguments.floats.count),
+            data: copy arguments.floats
+        }
+    )
+    let uniform = match made {
+        Ok(uniform) -> uniform
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.uniforms.append(copy uniform)
+    var descriptor = BindGroupDescriptor {
+        label: "renderbox-shader-arguments",
+        uniformEntries: [
+            UniformBindEntry { uniformSlot: ShaderFillDrawing.argumentsBinding, uniform: uniform }
+        ]
+    }
+    for (index, image) in arguments.images.enumerated() {
+        let slot = ShaderFillDrawing.firstImageBinding + UN32(index * 2)
+        descriptor.textureEntries.append(
+            TextureBindEntry { textureSlot: slot, texture: copy image.texture }
+        )
+        descriptor.samplerEntries.append(
+            SamplerBindEntry { samplerSlot: slot + 1, sampler: copy session.sampler }
+        )
+    }
+    let bindGroup = match graphics.createBindGroup(descriptor) {
+        Ok(bindGroup) -> bindGroup
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.bindGroups.append(copy bindGroup)
+    return .Ok(bindGroup)
+}

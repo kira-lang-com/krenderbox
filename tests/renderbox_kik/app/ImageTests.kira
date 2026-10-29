@@ -1,0 +1,51 @@
+import Foundation
+import RenderBox
+
+// A red texel beside a blue one, stretched over the whole target.
+function stretchedImage(interpolation: InterpolationMode) -> Result<[UN8], RenderFailure> {
+    let bitmap = Bitmap { width: 2, height: 1, pixels: [255, 0, 0, 255, 0, 0, 255, 255] }
+    let side = Number(RenderTarget.side)
+    var fill = Fill()
+    fill.setImage(
+        ImageFill {
+            image: .Bitmap(bitmap),
+            transform: AffineTransform { a: side, d: side },
+            interpolation: interpolation,
+            tint: .None,
+            colorSpace: .StandardRgb
+        }
+    )
+    var shape = Shape()
+    shape.setRect(Rect { width: side, height: side })
+    var list = DisplayList()
+    list.drawShape(shape, fill, 1, .Normal)
+    return renderLayer(
+        list.moveContents(),
+        RenderTarget.side,
+        RenderTarget.side,
+        RenderTarget.clear
+    )
+}
+
+function acrossTheRow() -> [Point] {
+    return [Point { x: 0, y: 4 }, Point { x: 3, y: 4 }, Point { x: 4, y: 4 }, Point { x: 7, y: 4 }]
+}
+
+// Linear between texel centres, held at the edge texel past them.
+@Test
+function imageFillsLinearly() {
+    expect!(imageFillsLinearlyResult() == "255/255 159/255 96/255 0/255")
+}
+
+function imageFillsLinearlyResult() -> String {
+    return sampled(stretchedImage(.Linear), acrossTheRow())
+}
+
+@Test
+function imageFillsNearest() {
+    expect!(imageFillsNearestResult() == "255/255 255/255 0/255 0/255")
+}
+
+function imageFillsNearestResult() -> String {
+    return sampled(stretchedImage(.None), acrossTheRow())
+}

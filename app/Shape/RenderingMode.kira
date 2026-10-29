@@ -1,0 +1,19 @@
+import Foundation
+
+// RB::RenderingMode: what a shape's coverage is. The distance modes draw a
+// distance field instead of an edge: the value at a point is its distance to
+// the outline, inside, outside or signed, out to the shape's rendering mode
+// argument.
+public enum RenderingMode: UN32 {
+    Antialiased = 0
+    Aliased = 1
+    InnerDistance = 2
+    OuterDistance = 3
+    SignedDistance = 4
+}
+
+// RBRoundedCornerStyle.
+public enum RoundedCornerStyle: UN32 {
+    Circular = 0
+    Continuous = 1
+}

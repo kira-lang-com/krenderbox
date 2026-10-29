@@ -1,0 +1,549 @@
+import Foundation
+import Ember
+
+// What a draw puts under its coverage: a colour, or a texture times a colour.
+enum Paint {
+    Solid(RGBAColor)
+    Textured(TexturePaint)
+}
+
+struct TexturePaint {
+    let texture: GraphicsTexture
+    // Device pixel to the texture's coordinates.
+    let fromDevice: AffineTransform
+    // Premultiplied; every texel is multiplied by it.
+    let color: RGBAColor
+    // How the texture is filtered between texels.
+    let sampler: GraphicsSampler
+    // The texels' conversion into the pass's colour space, as the shaders
+    // read it (RB::Shader::ImageGlobals); none for a surface of the pass's.
+    var conversion: [Number] = ImageConversion.none
+}
+
+// The sampler `paint` reads its texture through; a colour reads the white
+// texel, through any.
+function paintSampler(paint: borrow Paint, fallback: borrow GraphicsSampler) -> GraphicsSampler {
+    return match paint {
+        Solid(color) -> copy fallback
+        Textured(textured) -> copy textured.sampler
+    }
+}
+
+// RB::DisplayList::Layer's items in order, into `target` cleared to `clear`.
+// A layer that needs the background starts from `backdrop`, what is under it.
+// Every surface made on the way goes back to the session before it returns.
+function renderContents(
+    session: borrow mut RenderSession,
+    contents: borrow LayerContents,
+    target: borrow GraphicsTexture,
+    clear: borrow RGBAColor,
+    backdrop: borrow GraphicsTexture?
+) -> Result<Void, RenderFailure> {
+    let mark = lentMark(session)
+    var pass = PlannedPass {
+        target: copy target,
+        start: .Cleared(copy clear),
+        pending: mark,
+        settled: mark
+    }
+    if contents.flags.has(LayerFlags.needsBackground) {
+        let below = try backdrop otherwise return .Error(.UnportedLayer)
+        pass.draws.append(try copyDraw(session, below))
+    }
+    let items = try shadowsLowered(contents.items)
+    for item in items {
+        pass = try passWithItem(session, move pass, item, mark)
+    }
+    try pass.drawn(session, mark)
+    returnSurfaces(session, mark, lentMark(session), [copy target])
+    return .Ok
+}
+
+// `pass` with `item`'s draw added, and drawn at once when the draw reads
+// surfaces of its own, so they go back to the session before the next item
+// makes more.
+function passWithItem(
+    session: borrow mut RenderSession,
+    pass: PlannedPass,
+    item: borrow Item,
+    mark: Number
+) -> Result<PlannedPass, RenderFailure> {
+    var planned = move pass
+    // A layer that needs the background ends the pass, so it reads what was
+    // drawn before it.
+    if needsBackground(item) {
+        planned = try passReading(session, move planned, mark)
+    }
+    let draw = match try itemDraw(session, item, planned.below) {
+        Some(draw) -> draw
+        None -> return .Ok(planned)
+    }
+    match draw.destination {
+        Wanted -> planned = try passReading(session, move planned, mark)
+        Absent -> {}
+        Unused -> {}
+        Read(group) -> {}
+    }
+    planned.add(session, move draw)
+    if lentMark(session) > planned.settled { try planned.drawn(session, mark) }
+    return .Ok(planned)
+}
+
+// One item's draw; a layer that needs the background reads `below`.
+function itemDraw(
+    session: borrow mut RenderSession,
+    item: borrow Item,
+    below: borrow GraphicsTexture?
+) -> Result<RecordedDraw?, RenderFailure> {
+    return match item {
+        Shape(shape) -> shapeDraw(session, shape)
+        Layer(layer) -> layerDraw(session, layer, below)
+    }
+}
+
+function needsBackground(item: borrow Item) -> Bool {
+    return match item {
+        Shape(shape) -> false
+        Layer(layer) -> layer.contents.flags.has(LayerFlags.needsBackground)
+    }
+}
+
+// The draws a pass will make into its target. A draw that reads the
+// destination ends the pass: the target as it stood is copied into a
+// snapshot the draw reads, and the pass goes on drawing into the target.
+struct PlannedPass {
+    var target: GraphicsTexture
+    var start: PassStart
+    var draws: [RecordedDraw] = []
+    // The snapshot a reading draw reads.
+    var below: GraphicsTexture? = .None
+    // How many surfaces were lent out when the last draw was added: the
+    // ones lent after are an item's whose draw is not in the pass yet.
+    var pending: Number
+    // How many surfaces were lent out, the item's left out, when the pass
+    // last gave its own back.
+    var settled: Number
+}
+
+extend PlannedPass {
+    function add(borrow mut self, session: borrow mut RenderSession, draw: RecordedDraw) {
+        var placed = move draw
+        match placed.destination {
+            Wanted -> placed.destination = destinationRead(session, below)
+            Absent -> {}
+            Unused -> {}
+            Read(group) -> {}
+        }
+        draws.append(move placed)
+        pending = lentMark(session)
+    }
+
+    // The draws so far, into the target, and every surface lent since `mark`
+    // that only they read given back. The pass goes on from what they drew.
+    function drawn(
+        borrow mut self,
+        session: borrow mut RenderSession,
+        mark: Number
+    ) -> Result<Void, RenderFailure> {
+        match start {
+            // Nothing to clear and nothing to draw.
+            Loaded -> if draws.count == 0 { return .Ok }
+            Cleared(clear) -> {}
+        }
+        try drawPassFrom(session, target, start, draws)
+        draws = []
+        start = .Loaded
+        // A snapshot is read only by the draw it was taken for, drawn now.
+        below = .None
+        let unplaced = lentMark(session) - pending
+        returnSurfaces(session, mark, pending, [copy target])
+        settled = lentMark(session) - unplaced
+        pending = settled
+        return .Ok
+    }
+
+}
+
+// `pass` drawn, and a snapshot of its target for a destination-reading
+// draw to read while the pass goes on.
+function passReading(
+    session: borrow mut RenderSession,
+    pass: PlannedPass,
+    mark: Number
+) -> Result<PlannedPass, RenderFailure> {
+    var reading = move pass
+    try reading.drawn(session, mark)
+    let snapshot = try surface(session, "renderbox-snapshot")
+    let copied = try copyDraw(session, reading.target)
+    try drawPass(session, snapshot, Surfaces.transparent, [copied])
+    reading.below = .Some(snapshot)
+    // The snapshot is lent after the item's own surfaces.
+    reading.settled += 1
+    return .Ok(reading)
+}
+
+// `texture` written over the whole target as it is.
+function copyDraw(
+    session: borrow mut RenderSession,
+    texture: borrow GraphicsTexture
+) -> Result<RecordedDraw, RenderFailure> {
+    let paint = surfacePaint(session, copy texture, 1)
+    return match try wholeTargetDraw(session, move paint, .None, .Copy) {
+        Some(draw) -> .Ok(draw)
+        None -> .Error(.UnportedLayer)
+    }
+}
+
+// `group Destination` with the surface a reading draw reads.
+function destinationRead(
+    session: borrow mut RenderSession,
+    below: borrow GraphicsTexture?
+) -> DestinationSlot {
+    let texture = match below {
+        Some(texture) -> copy texture
+        None -> return .Unused
+    }
+    let group = match session.device.graphics().createBindGroup(destinationBindings(texture)) {
+        Ok(group) -> group
+        Error(failure) -> return .Unused
+    }
+    session.bindGroups.append(copy group)
+    return .Read(group)
+}
+
+function shapeDraw(
+    session: borrow mut RenderSession,
+    item: borrow ShapeItem
+) -> Result<RecordedDraw?, RenderFailure> {
+    if item.state.styles.count > 0 {
+        return filteredShapeDraw(session, item)
+    }
+    let painted: Result<Paint, RenderFailure> = match item.fill {
+        Color(fill) -> solidPaint(session, fill, item.headroom, item.alpha)
+        Gradient(gradient) -> gradientPaint(session, gradient, item.state.transform, item.alpha)
+        Image(image) -> imagePaint(session, image, item.headroom, item.state.transform, item.alpha)
+        Shader(fill) -> shaderPaint(session, fill, item.state.transform, item.alpha)
+        MeshGradient(mesh) -> meshPaint(session, mesh, item.state.transform, item.alpha)
+    }
+    let paint = match painted {
+        Ok(paint) -> paint
+        Error(failure) -> return .Error(failure)
+    }
+    let mask = match clipMask(session, item.state.clips) {
+        Ok(mask) -> mask
+        Error(failure) -> return .Error(failure)
+    }
+    return match item.shape.data {
+        Primitive(primitive) -> primitiveDraw(session, item, primitive, move paint, move mask)
+        FilledPath(filled) -> pathDraw(session, filled, item, move paint, move mask)
+        StrokedPath(stroked) -> strokeDraw(session, stroked, item, move paint, move mask)
+    }
+}
+
+// The primitive drawn in the snapshot's rendering mode.
+function primitiveDraw(
+    session: borrow mut RenderSession,
+    item: borrow ShapeItem,
+    primitive: borrow Primitive,
+    paint: Paint,
+    mask: GraphicsTexture?
+) -> Result<RecordedDraw?, RenderFailure> {
+    let shaped = inRenderingMode(primitive, item.shape)
+    let drawn = primitiveGlobals(shaped, item.state.transform, session.size(), item.blendMode)
+    return match drawn {
+        Ok(draw) -> recordedDraw(session, move draw, move paint, move mask, item.blendMode)
+        Error(failure) -> .Error(.Primitive(failure))
+    }
+}
+
+// The primitive a snapshot covers, drawn in the snapshot's rendering mode.
+function snapshotPrimitive(shape: borrow ShapeSnapshot) -> Primitive? {
+    return match shape.data {
+        Primitive(primitive) -> .Some(inRenderingMode(primitive, shape))
+        FilledPath(path) -> .None
+        StrokedPath(path) -> .None
+    }
+}
+
+function inRenderingMode(primitive: borrow Primitive, shape: borrow ShapeSnapshot) -> Primitive {
+    var shaped = copy primitive
+    shaped.renderingMode = shape.renderingMode
+    shaped.renderingModeArgument = shape.renderingModeArgument
+    return shaped
+}
+
+// render_primitive(Fill::Color): the colour premultiplied, times the item's
+// alpha.
+// RB::Fill::Color::prepare: a colour in a space other than the pass's, or
+// with headroom, converted into the pass's, as halves. The pass has no
+// headroom, so nothing is tone mapped.
+function solidPaint(
+    session: borrow RenderSession,
+    fill: borrow ColorFill,
+    headroom: Number,
+    alpha: Number
+) -> Result<Paint, RenderFailure> {
+    let space = match spaceCode(fill.colorSpace) {
+        Some(space) -> space
+        None -> session.colorSpace
+    }
+    if space == session.colorSpace && headroom == 0 {
+        return .Ok(.Solid(premultiplied(fill.color, alpha)))
+    }
+    let conversion = try colorConversion(space, headroom, session.colorSpace, 0)
+    let color = conversion.converted(halfColor(fill.color))
+    return .Ok(.Solid(premultiplied(color, alpha)))
+}
+
+function halfColor(color: borrow RGBAColor) -> RGBAColor {
+    return RGBAColor {
+        r: halfRounded(color.r),
+        g: halfRounded(color.g),
+        b: halfRounded(color.b),
+        a: halfRounded(color.a)
+    }
+}
+
+function premultiplied(color: borrow RGBAColor, alpha: Number) -> RGBAColor {
+    let a = color.a * alpha
+    return RGBAColor { r: color.r * a, g: color.g * a, b: color.b * a, a: a }
+}
+
+// A layer's items drawn into a surface of their own, then that surface
+// composited over the whole target at the layer's alpha and blend.
+// A layer needing the background starts from `backdrop`. The state's styles
+// filter the layer before it is composited through the clips.
+function layerDraw(
+    session: borrow mut RenderSession,
+    item: borrow LayerItem,
+    backdrop: borrow GraphicsTexture?
+) -> Result<RecordedDraw?, RenderFailure> {
+    let inner = innerClips(item.state)
+    let scale = blurLayerScale(item.state, item.contents)
+    if scale < 1 && backdrop == .None {
+        let reduced = try reducedBlurredSurface(session, item.contents, item.state, inner, scale)
+        match reduced {
+            Some(texture) -> return styledComposite(
+                session,
+                move texture,
+                item.state,
+                item.alpha,
+                item.blendMode,
+                item.state.styles.count - 1
+            )
+            None -> {}
+        }
+    }
+    var texture = try renderedSurface(session, item.contents, backdrop)
+    if item.state.styles.count > 0 && inner.count > 0 {
+        texture = try clippedSurface(session, move texture, inner, 1)
+    }
+    return styledComposite(
+        session,
+        move texture,
+        item.state,
+        item.alpha,
+        item.blendMode,
+        item.state.styles.count
+    )
+}
+
+// FilterStyle::draw: the shape drawn alone through the clips added after the
+// styles, filtered, then composited through the rest and the item's blend.
+function filteredShapeDraw(
+    session: borrow mut RenderSession,
+    item: borrow ShapeItem
+) -> Result<RecordedDraw?, RenderFailure> {
+    let alone = ShapeItem {
+        shape: copy item.shape,
+        fill: copy item.fill,
+        headroom: item.headroom,
+        alpha: 1,
+        blendMode: .Normal,
+        state: DrawingState {
+            transform: copy item.state.transform,
+            clips: innerClips(item.state),
+            contentHeadroom: item.state.contentHeadroom
+        }
+    }
+    let contents = LayerContents { items: [.Shape(alone)] }
+    let scale = blurLayerScale(item.state, contents)
+    var reduced: GraphicsTexture? = .None
+    if scale < 1 {
+        reduced = try reducedBlurredSurface(session, contents, item.state, [], scale)
+    }
+    let count = item.state.styles.count
+    let unfiltered = reduced == .None ? count : count - 1
+    let texture = match reduced {
+        Some(small) -> small
+        None -> try renderedSurface(session, contents, .None)
+    }
+    return styledComposite(
+        session,
+        move texture,
+        item.state,
+        item.alpha,
+        item.blendMode,
+        unfiltered
+    )
+}
+
+// The state's styles as Builder::apply_filter_ nests them: the style added
+// last filters first, the clips added between two styles clip what the inner
+// one made, and the clips before the first style clip the result as it is
+// composited over the whole target through `blend`. Styles from `unfiltered`
+// on have filtered `texture` already.
+function styledComposite(
+    session: borrow mut RenderSession,
+    texture: GraphicsTexture,
+    state: borrow DrawingState,
+    alpha: Number,
+    blend: BlendMode,
+    unfiltered: Number
+) -> Result<RecordedDraw?, RenderFailure> {
+    let styles = try filterStyles(state.styles)
+    var filtered = texture
+    var opacity = alpha
+    var index = styles.count
+    while index > 0 {
+        index -= 1
+        if index < unfiltered {
+            let (next, nextOpacity) = try settledStyle(
+                session,
+                move filtered,
+                styles[index],
+                opacity
+            )
+            filtered = next
+            opacity = nextOpacity
+        }
+        let between = index > 0
+        ? clipsBetween(state.clips, state.styleClipCounts[index - 1], state.styleClipCounts[index])
+        : []
+        if between.count > 0 {
+            filtered = try clippedSurface(session, move filtered, between, opacity)
+            opacity = 1
+        }
+    }
+    let outer = styles.count == 0
+    ? copy state.clips
+    : clipsBetween(state.clips, 0, state.styleClipCounts[0])
+    let mask = try clipMask(session, outer)
+    let paint = surfacePaint(session, move filtered, opacity)
+    return wholeTargetDraw(session, move paint, move mask, blend)
+}
+
+// The clips added after the state's last style, which clip the content
+// before any style filters it.
+function innerClips(state: borrow DrawingState) -> [Clip] {
+    if state.styleClipCounts.count == 0 {
+        return copy state.clips
+    }
+    let last = state.styleClipCounts[state.styleClipCounts.count - 1]
+    return clipsBetween(state.clips, last, state.clips.count)
+}
+
+function clipsBetween(clips: borrow [Clip], from: UNumber, to: UNumber) -> [Clip] {
+    var between: [Clip] = []
+    for index in from..to {
+        between.append(copy clips[index])
+    }
+    return between
+}
+
+// `texture` at `opacity` through `clips`' mask, into a surface of its own.
+function clippedSurface(
+    session: borrow mut RenderSession,
+    texture: GraphicsTexture,
+    clips: borrow [Clip],
+    opacity: Number
+) -> Result<GraphicsTexture, RenderFailure> {
+    let before = copy texture
+    let mark = lentMark(session)
+    let target = try surface(session, "renderbox-clipped-layer")
+    let mask = try clipMask(session, clips)
+    let paint = surfacePaint(session, move texture, opacity)
+    let draw = try wholeTargetDraw(session, move paint, move mask, .Normal)
+    var draws: [RecordedDraw] = []
+    appendDraw(draws, move draw)
+    try drawPass(session, target, Surfaces.transparent, draws)
+    settleStep(session, mark, before, target)
+    return .Ok(target)
+}
+
+// `texture` filtered by `style`, the step settled.
+function settledStyle(
+    session: borrow mut RenderSession,
+    texture: GraphicsTexture,
+    style: borrow Style,
+    opacity: Number
+) -> Result<(GraphicsTexture, Number), RenderFailure> {
+    let before = copy texture
+    let mark = lentMark(session)
+    let (next, nextOpacity) = try styleFiltered(session, move texture, style, opacity)
+    settleStep(session, mark, before, next)
+    return .Ok((next, nextOpacity))
+}
+
+// A drawn step of a layer's styles and clips settled: every surface lent
+// since `mark` but its `result` taken back, and the surface it read too,
+// unless the step handed that back as its result.
+function settleStep(
+    session: borrow mut RenderSession,
+    mark: Number,
+    before: borrow GraphicsTexture,
+    result: borrow GraphicsTexture
+) {
+    returnSurfaces(session, mark, lentMark(session), [copy result])
+    returnStep(session, before, result)
+}
+
+function renderedSurface(
+    session: borrow mut RenderSession,
+    contents: borrow LayerContents,
+    backdrop: borrow GraphicsTexture?
+) -> Result<GraphicsTexture, RenderFailure> {
+    let texture = try surface(session, "renderbox-layer")
+    try renderContents(session, contents, texture, Surfaces.transparent, backdrop)
+    return .Ok(texture)
+}
+
+// A target-sized surface as paint, read pixel for pixel, at `alpha`.
+function surfacePaint(
+    session: borrow RenderSession,
+    texture: GraphicsTexture,
+    alpha: Number
+) -> Paint {
+    let fromDevice = AffineTransform { a: 1 / Number(session.width), d: 1 / Number(session.height) }
+    let color = RGBAColor { r: alpha, g: alpha, b: alpha, a: alpha }
+    return .Textured(
+        TexturePaint {
+            texture: texture,
+            fromDevice: fromDevice,
+            color: color,
+            sampler: copy session.sampler
+        }
+    )
+}
+
+// `paint` over the whole target through `blend`.
+function wholeTargetDraw(
+    session: borrow mut RenderSession,
+    paint: Paint,
+    mask: GraphicsTexture?,
+    blend: BlendMode
+) -> Result<RecordedDraw?, RenderFailure> {
+    let whole = Primitive { kind: .Rect, rect: session.wholeTarget() }
+    return match primitiveGlobals(whole, AffineTransform(), session.size(), blend) {
+        Ok(draw) -> recordedDraw(session, move draw, move paint, move mask, blend)
+        Error(failure) -> .Error(.Primitive(failure))
+    }
+}
+
+// A draw onto a pass's list, when there is one.
+function appendDraw(draws: borrow mut [RecordedDraw], draw: RecordedDraw?) {
+    match draw {
+        Some(one) -> draws.append(one)
+        None -> {}
+    }
+}

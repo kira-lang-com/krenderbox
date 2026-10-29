@@ -1,0 +1,614 @@
+import Foundation
+
+// RB::Shader::PrimitiveType: which distance function a primitive's fragments
+// measure. RenderBox picks it per draw from the primitive's kind, its corners
+// and how large it lands on screen.
+public enum PrimitiveType: UN8 {
+    Empty = 0
+    Infinite = 1
+    Rect = 2
+    RoundedRect = 3
+    ContinuousRoundedRect = 4
+    Circle = 5
+    CornerRoundedRect = 6
+    CornerContinuousRect = 7
+    OverlappingCornerRect = 8
+    OverlappingCornerContinuousRect = 9
+    MeetingContinuousRect = 10
+    PixelRect = 11
+}
+
+// How a distance becomes coverage: RB::Shader::PrimitiveCoverageState's
+// bits 4 and 5.
+public enum CoverageMode: UN8 {
+    Antialiased = 0
+    Aliased = 1
+    Blurred = 2
+    Distance = 3
+}
+
+public enum PrimitiveFailure {
+    // A type whose distance function is not ported yet.
+    UnportedType(PrimitiveType)
+}
+
+// What set_globals draws: nothing, when the blend leaves the destination
+// alone outside an empty shape, or one quad.
+public enum PrimitiveDraw {
+    Nothing
+    Quad(PrimitiveGlobals)
+}
+
+namespace PrimitiveThresholds {
+    // A corner smaller than this is square, and radii closer than this are
+    // the same radius.
+    let squareCorner: Number = 0.01
+    // Below this squared device extent, a rect is a pixel rect, its coverage
+    // the exact area under each pixel.
+    let pixelRectExtent: Number = 6.25
+    // How far from a whole pixel a device rect's edges may be and still need
+    // no antialiasing: the constant set_globals hands RB::Rect::is_integral.
+    let integralTolerance: Number = 0.005
+    // set_globals' test for continuous corners that meet along an edge.
+    let meetingRadiusScale: Number = 0.78431374
+    let meetingSpan: Number = 0.41463917
+    let meetingTolerance: Number = 0.0001
+    // A blurred edge's coverage falls over this times its deviation, and
+    // its quad reaches 2.8 deviations and a unit past the shape.
+    let blurredDistanceScale: Number = 0.16955733
+    let blurredOutsetScale: Number = 2.8
+    let blurredOutset: Number = 1
+    // The signed distance mode centres coverage on the edge.
+    let signedDistanceScale: Number = 0.5
+    let signedDistanceOffset: Number = 0.5
+    // Half a device pixel: the thinnest stroke drawn at full coverage.
+    let halfPixel: Number = 0.5
+}
+
+// RB::Shader::PrimitiveGlobals, as `Shaders/Primitive.ksl` lays it out.
+public struct PrimitiveGlobals {
+    var columnX: Point = Point()
+    var columnY: Point = Point()
+    var translation: Point = Point()
+    var halfSize: Size = Size()
+    var radii: CornerRadii = CornerRadii()
+    var horizontalScale: Number = 1
+    var halfLineWidth: Number = 0
+    var alpha: Number = 1
+    var shapeType: PrimitiveType = .Empty
+    var coverageMode: CoverageMode = .Antialiased
+    var stroke: Bool = false
+    var invert: Bool = false
+    var depth: Number = 0
+    var distanceScale: Number = 0
+    var distanceOffset: Number = 0
+    var color: RGBAColor = RGBAColor()
+    // Device pixel to the fill texture's coordinates, when `textured`.
+    var fill: AffineTransform = AffineTransform()
+    var textured: Bool = false
+    // How the fill texture's texels are converted into the pass's space.
+    var conversion: [Number] = ImageConversion.none
+    // Whether the clip mask multiplies coverage, and device pixel to mask
+    // coordinates.
+    var masked: Bool = false
+    var maskScale: Point = Point()
+    // RB::BlendMode when the shader blends, reading the destination.
+    var blendCode: Number = 0
+    var shaderBlend: Bool = false
+
+    // The uniform's floats, in the shader's packing: `color` starts on a
+    // sixteen-byte boundary, two floats after `distanceParameters`, and the
+    // block ends padded to sixteen bytes.
+    function floats() -> [Number] {
+        var floats = [
+            columnX.x, columnX.y, columnY.x, columnY.y, translation.x, translation.y,
+            halfSize.width, halfSize.height, radii.topLeft, radii.topRight, radii.bottomRight,
+            radii.bottomLeft, horizontalScale, halfLineWidth, alpha, code(shapeType),
+            code(coverageMode), stroke ? 1 : 0, invert ? 1 : 0, depth, distanceScale,
+            distanceOffset, 0, 0, color.r, color.g, color.b, color.a, fill.a, fill.b, fill.c,
+            fill.d, fill.tx, fill.ty, textured ? 1 : 0, masked ? 1 : 0, maskScale.x, maskScale.y,
+            blendCode, shaderBlend ? 1 : 0
+        ]
+        floats.appendAll(copy conversion)
+        return floats
+    }
+}
+
+// The primitive's space as set_globals measures it: the CTM with the
+// primitive's horizontal squeeze applied, the largest scale along either of
+// its axes, and the render target's size in pixels.
+struct PrimitiveSpace {
+    let transform: AffineTransform
+    let scale: Number
+    let target: Size
+}
+
+function primitiveSpace(
+    primitive: borrow Primitive,
+    transform: borrow AffineTransform,
+    target: borrow Size
+) -> PrimitiveSpace {
+    let squeezed = AffineTransform {
+        a: transform.a * primitive.horizontalScale,
+        b: transform.b * primitive.horizontalScale,
+        c: transform.c,
+        d: transform.d,
+        tx: transform.tx,
+        ty: transform.ty
+    }
+    let scale = max(max(abs(squeezed.a), abs(squeezed.b)), max(abs(squeezed.c), abs(squeezed.d)))
+    return PrimitiveSpace { transform: squeezed, scale: scale, target: copy target }
+}
+
+// RB::Coverage::Primitive::set_globals for the shapes RenderBox draws as one
+// quad. The colour is the caller's: render_primitive sets it from the fill.
+// Above 4096 device pixels RenderBox draws the opaque interior with a mesh of
+// its own to skip shading it; one quad covers the same pixels.
+public function primitiveGlobals(
+    primitive: borrow Primitive,
+    transform: borrow AffineTransform,
+    target: Size,
+    blend: BlendMode
+) -> Result<PrimitiveDraw, PrimitiveFailure> {
+    let space = primitiveSpace(primitive, transform, target)
+    let discards = mayDiscard(primitive, blend)
+    let drawn: Result<PrimitiveDraw, PrimitiveFailure> = match primitive.kind {
+        Empty -> discards ? .Ok(.Nothing) : covering(.Empty, space)
+        Infinite -> covering(.Infinite, space)
+        Rect -> shaped(primitive, space, discards)
+        RoundedRect -> shaped(primitive, space, discards)
+        ContinuousRoundedRect -> shaped(primitive, space, discards)
+        Ellipse -> shaped(primitive, space, discards)
+        ButtLine -> lined(primitive, space, discards)
+        RoundLine -> lined(primitive, space, discards)
+        SquareLine -> lined(primitive, space, discards)
+    }
+    return match drawn {
+        Ok(draw) -> .Ok(withCoverageState(move draw, primitive))
+        Error(failure) -> .Error(failure)
+    }
+}
+
+// set_globals asks whether the blend leaves the destination alone where the
+// source is clear: by alpha for the distance modes, by shape otherwise.
+function mayDiscard(primitive: borrow Primitive, blend: BlendMode) -> Bool {
+    if primitive.coversByAlpha {
+        return mayDiscardAlpha(blend)
+    }
+    return match primitive.renderingMode {
+        Antialiased -> mayDiscardShape(blend)
+        Aliased -> mayDiscardShape(blend)
+        InnerDistance -> mayDiscardAlpha(blend)
+        OuterDistance -> mayDiscardAlpha(blend)
+        SignedDistance -> mayDiscardAlpha(blend)
+    }
+}
+
+// Whether the primitive draws a distance field: a distance mode with a
+// distance to reach out to.
+function drawsDistance(primitive: borrow Primitive) -> Bool {
+    let reaches = primitive.renderingModeArgument > 0
+    return match primitive.renderingMode {
+        Antialiased -> false
+        Aliased -> false
+        InnerDistance -> reaches
+        OuterDistance -> reaches
+        SignedDistance -> reaches
+    }
+}
+
+// Whether the primitive's edge is blurred: make_shadow's flag, with a
+// deviation to blur by.
+function blursEdge(primitive: borrow Primitive) -> Bool {
+    return primitive.blurred && primitive.renderingModeArgument > 0
+}
+
+// Whether set_globals measures the distance to the edge, to blur it or to
+// draw a distance field.
+function measuresEdge(primitive: borrow Primitive) -> Bool {
+    return blursEdge(primitive) || drawsDistance(primitive)
+}
+
+// RB::Coverage::Primitive::set_coverage_state: the outer and signed distance
+// fields are inverted inner ones, and an inverted primitive covers what lies
+// outside it. A line's width is its own, not a stroke.
+function withCoverageState(draw: PrimitiveDraw, primitive: borrow Primitive) -> PrimitiveDraw {
+    var globals = match draw {
+        Nothing -> return .Nothing
+        Quad(globals) -> globals
+    }
+    let blurred = blursEdge(primitive)
+    let distance = !blurred && drawsDistance(primitive)
+    let aliased = primitive.renderingMode == .Aliased
+    globals.coverageMode = blurred
+    ? .Blurred
+    : distance ? .Distance : aliased ? .Aliased : .Antialiased
+    let outward = distance && primitive.renderingMode != .InnerDistance
+    globals.invert = primitive.inverted != outward
+    let line = match primitive.kind {
+        ButtLine -> true
+        RoundLine -> true
+        SquareLine -> true
+        Empty -> false
+        Infinite -> false
+        Rect -> false
+        RoundedRect -> false
+        ContinuousRoundedRect -> false
+        Ellipse -> false
+    }
+    globals.stroke = !line && primitive.lineWidth > 0
+    return .Quad(globals)
+}
+
+// An empty or infinite primitive covers the whole render target.
+function covering(
+    shapeType: PrimitiveType,
+    space: borrow PrimitiveSpace
+) -> Result<PrimitiveDraw, PrimitiveFailure> {
+    let target = Rect { width: space.target.width, height: space.target.height }
+    let local = match space.transform.inverted() {
+        Some(inverse) -> inverse.applying(target)
+        None -> space.transform.applying(target)
+    }
+    let globals = PrimitiveGlobals { shapeType: shapeType }
+    return .Ok(.Quad(placed(move globals, local, space)))
+}
+
+// Rects, rounded rects and ellipses.
+function shaped(
+    primitive: borrow Primitive,
+    space: borrow PrimitiveSpace,
+    discards: Bool
+) -> Result<PrimitiveDraw, PrimitiveFailure> {
+    if fillsWithoutEdge(primitive, space, discards) {
+        let globals = PrimitiveGlobals { shapeType: .Infinite }
+        return .Ok(.Quad(placed(move globals, primitive.rect, space)))
+    }
+    if isPixelRect(primitive, space) {
+        let globals = PrimitiveGlobals { shapeType: .PixelRect, halfSize: halfOf(primitive.rect) }
+        return .Ok(.Quad(finished(move globals, primitive, space, discards)))
+    }
+    return match edged(primitive) {
+        Ok(globals) -> .Ok(.Quad(finished(move globals, primitive, space, discards)))
+        Error(failure) -> .Error(failure)
+    }
+}
+
+function halfOf(rect: borrow Rect) -> Size {
+    return Size { width: rect.width / 2, height: rect.height / 2 }
+}
+
+// A filled rect the blend may stop at needs no edge when it is aliased, when
+// it lands on whole pixels, or when it covers the whole target: the quad's
+// own rasterization is its coverage.
+function fillsWithoutEdge(
+    primitive: borrow Primitive,
+    space: borrow PrimitiveSpace,
+    discards: Bool
+) -> Bool {
+    let plain = primitive.kind == .Rect && primitive.lineWidth <= 0 && !measuresEdge(primitive)
+    if !plain || !discards {
+        return false
+    }
+    if primitive.renderingMode == .Aliased {
+        return true
+    }
+    let t = space.transform
+    let axisAligned = (t.b == 0 && t.c == 0) || (t.a == 0 && t.d == 0)
+    if !axisAligned {
+        return false
+    }
+    let device = t.applying(primitive.rect)
+    let target = Rect { width: space.target.width, height: space.target.height }
+    return isIntegral(device, PrimitiveThresholds.integralTolerance) || encloses(device, target)
+}
+
+// RB::Rect::is_integral.
+function isIntegral(rect: borrow Rect, tolerance: Number) -> Bool {
+    let edges = [rect.x, rect.y, rect.x + rect.width, rect.y + rect.height]
+    for edge in edges {
+        if abs(edge - trunc(edge)) > tolerance {
+            return false
+        }
+    }
+    return true
+}
+
+// RB::Rect::contains(Rect): an empty `inner` is in nothing.
+function encloses(outer: borrow Rect, inner: borrow Rect) -> Bool {
+    if inner.width == 0 || inner.height == 0 {
+        return false
+    }
+    let low = Point { x: min(outer.x, outer.maxX()), y: min(outer.y, outer.maxY()) }
+    let innerLow = Point { x: min(inner.x, inner.maxX()), y: min(inner.y, inner.maxY()) }
+    let reachesLow = low.x <= innerLow.x && low.y <= innerLow.y
+    let reachesHigh = innerLow.x + abs(inner.width) <= low.x + abs(outer.width)
+        && innerLow.y + abs(inner.height) <= low.y + abs(outer.height)
+    return reachesLow && reachesHigh
+}
+
+// A plain filled antialiased rect, rounded or not, that covers less than
+// two and a half pixels across one of its sides.
+function isPixelRect(primitive: borrow Primitive, space: borrow PrimitiveSpace) -> Bool {
+    let rectangular = match primitive.kind {
+        Rect -> true
+        RoundedRect -> true
+        ContinuousRoundedRect -> true
+        Empty -> false
+        Infinite -> false
+        Ellipse -> false
+        ButtLine -> false
+        RoundLine -> false
+        SquareLine -> false
+    }
+    let plain = primitive.renderingMode != .Aliased && !measuresEdge(primitive)
+    if !rectangular || !plain || primitive.lineWidth > 0 {
+        return false
+    }
+    let t = space.transform
+    let width = primitive.rect.width
+    let height = primitive.rect.height
+    let across = (t.a * width) * (t.a * width) + (t.b * width) * (t.b * width)
+    let down = (t.c * height) * (t.c * height) + (t.d * height) * (t.d * height)
+    return min(across, down) < PrimitiveThresholds.pixelRectExtent
+}
+
+// The distance function a rect, rounded rect or ellipse needs, with its
+// half size and radii in the primitive's own units.
+function edged(primitive: borrow Primitive) -> Result<PrimitiveGlobals, PrimitiveFailure> {
+    let half = halfOf(primitive.rect)
+    let distance = measuresEdge(primitive)
+    return match primitive.kind {
+        Rect -> .Ok(PrimitiveGlobals { shapeType: distance ? .RoundedRect : .Rect, halfSize: half })
+        RoundedRect -> cornered(primitive, .RoundedRect, half, distance)
+        ContinuousRoundedRect -> cornered(primitive, .ContinuousRoundedRect, half, distance)
+        Ellipse -> cornered(primitive, .Circle, half, distance)
+        Empty -> .Ok(PrimitiveGlobals { shapeType: .Empty })
+        Infinite -> .Ok(PrimitiveGlobals { shapeType: .Infinite })
+        // `lined` draws a line as the rect it covers, so none reaches here.
+        ButtLine -> .Ok(PrimitiveGlobals { shapeType: .Empty })
+        RoundLine -> .Ok(PrimitiveGlobals { shapeType: .Empty })
+        SquareLine -> .Ok(PrimitiveGlobals { shapeType: .Empty })
+    }
+}
+
+function nonNegative(radii: borrow CornerRadii) -> CornerRadii {
+    return CornerRadii {
+        topLeft: max(radii.topLeft, 0),
+        topRight: max(radii.topRight, 0),
+        bottomRight: max(radii.bottomRight, 0),
+        bottomLeft: max(radii.bottomLeft, 0)
+    }
+}
+
+function radiusList(radii: borrow CornerRadii) -> [Number] {
+    return [radii.topLeft, radii.topRight, radii.bottomRight, radii.bottomLeft]
+}
+
+// Square corners make a rect; equal corners keep the kind's own type, its box
+// shrunk by the radius; unequal corners measure each quadrant's own radius.
+function cornered(
+    primitive: borrow Primitive,
+    uniformType: PrimitiveType,
+    half: borrow Size,
+    distance: Bool
+) -> Result<PrimitiveGlobals, PrimitiveFailure> {
+    let radii = nonNegative(primitive.cornerRadii)
+    let list = radiusList(radii)
+    var square = true
+    var uniform = true
+    for radius in list {
+        square = square && radius < PrimitiveThresholds.squareCorner
+        uniform = uniform && abs(radius - list[0]) < PrimitiveThresholds.squareCorner
+    }
+    if square && !distance {
+        return .Ok(PrimitiveGlobals { shapeType: .Rect, halfSize: copy half })
+    }
+    if !uniform {
+        return unevenCorners(uniformType, radii, half, primitive.rect)
+    }
+    let radius = list[0]
+    let continuous = uniformType == .ContinuousRoundedRect
+    if continuous && cornersMeet(half, radius, primitive.horizontalScale) {
+        return .Error(.UnportedType(.MeetingContinuousRect))
+    }
+    let inner = Size { width: half.width - radius, height: half.height - radius }
+    return .Ok(PrimitiveGlobals { shapeType: uniformType, halfSize: inner, radii: radii })
+}
+
+// Corners of different radii; past half the shorter side they overlap.
+function unevenCorners(
+    uniformType: PrimitiveType,
+    radii: borrow CornerRadii,
+    half: borrow Size,
+    rect: borrow Rect
+) -> Result<PrimitiveGlobals, PrimitiveFailure> {
+    let continuous = uniformType == .ContinuousRoundedRect
+    let limit = min(rect.width, rect.height) / 2
+    var overlapping = false
+    for radius in radiusList(radii) {
+        overlapping = overlapping || limit < radius
+    }
+    if overlapping {
+        let type: PrimitiveType = continuous ? .OverlappingCornerContinuousRect : .OverlappingCornerRect
+        return .Error(.UnportedType(type))
+    }
+    let type: PrimitiveType = continuous ? .CornerContinuousRect : .CornerRoundedRect
+    return .Ok(PrimitiveGlobals { shapeType: type, halfSize: copy half, radii: copy radii })
+}
+
+// Continuous corners that run into each other along a side, which set_globals
+// draws as a meeting continuous rect.
+function cornersMeet(half: borrow Size, radius: Number, horizontalScale: Number) -> Bool {
+    let reach = radius * PrimitiveThresholds.meetingRadiusScale
+    let span = radius * PrimitiveThresholds.meetingSpan
+    let across = (half.width - horizontalScale * reach) / span
+    let down = (half.height - reach) / span
+    return withinSpan(across) || withinSpan(down)
+}
+
+function withinSpan(t: Number) -> Bool {
+    return -PrimitiveThresholds.meetingTolerance < t && t < 1
+}
+
+// The rest of set_globals once the type is known: the distance field's
+// parameters, the stroke, and a quad grown to hold every touched pixel.
+function finished(
+    globals: PrimitiveGlobals,
+    primitive: borrow Primitive,
+    space: borrow PrimitiveSpace,
+    discards: Bool
+) -> PrimitiveGlobals {
+    var result = move globals
+    var outset = 1 / space.scale
+    if blursEdge(primitive) {
+        let blur = primitive.renderingModeArgument
+        result.distanceScale = PrimitiveThresholds.blurredDistanceScale / blur
+        outset = blur * PrimitiveThresholds.blurredOutsetScale + PrimitiveThresholds.blurredOutset
+    } else if drawsDistance(primitive) {
+        let (scale, offset) = distanceParameters(primitive)
+        result.distanceScale = scale
+        result.distanceOffset = offset
+        outset = primitive.renderingMode == .InnerDistance ? 0 : primitive.renderingModeArgument
+    }
+    let lineWidth = primitive.lineWidth
+    if lineWidth > 0 {
+        outset += lineWidth / 2
+        result = stroked(move result, primitive, space)
+    }
+    let margin = max(outset, 0)
+    let rect = primitive.rect
+    let quad = Rect {
+        x: rect.x - margin,
+        y: rect.y - margin,
+        width: rect.width + margin * 2,
+        height: rect.height + margin * 2
+    }
+    if !discards || primitive.inverted {
+        return placed(move result, reachingTarget(quad, space), space)
+    }
+    return placed(move result, quad, space)
+}
+
+// A quad that must also reach every pixel of the target, where the blend
+// changes what lies outside the shape or the coverage is outside it: the
+// union of the two in the primitive's space.
+function reachingTarget(quad: borrow Rect, space: borrow PrimitiveSpace) -> Rect {
+    let target = Rect { width: space.target.width, height: space.target.height }
+    let local = match space.transform.inverted() {
+        Some(inverse) -> inverse.applying(target)
+        None -> space.transform.applying(target)
+    }
+    let low = Point { x: min(quad.x, local.x), y: min(quad.y, local.y) }
+    let high = Point { x: max(quad.maxX(), local.maxX()), y: max(quad.maxY(), local.maxY()) }
+    return Rect { x: low.x, y: low.y, width: high.x - low.x, height: high.y - low.y }
+}
+
+// The distance field's scale and offset: inner fields count up into the
+// shape, outer ones out of it, signed ones across the edge from the middle.
+function distanceParameters(primitive: borrow Primitive) -> (Number, Number) {
+    let scale = 1 / primitive.renderingModeArgument
+    return match primitive.renderingMode {
+        InnerDistance -> (-scale, 0)
+        OuterDistance -> (scale, 0)
+        SignedDistance -> (
+            scale * PrimitiveThresholds.signedDistanceScale,
+            PrimitiveThresholds.signedDistanceOffset
+        )
+        Antialiased -> (0, 0)
+        Aliased -> (0, 0)
+    }
+}
+
+// A stroke thinner than a device pixel is drawn a pixel wide at the alpha
+// its width covers.
+function stroked(
+    globals: PrimitiveGlobals,
+    primitive: borrow Primitive,
+    space: borrow PrimitiveSpace
+) -> PrimitiveGlobals {
+    var result = move globals
+    let half = primitive.lineWidth / 2
+    if primitive.renderingMode == .Aliased {
+        result.halfLineWidth = half
+        return result
+    }
+    let thinnest = PrimitiveThresholds.halfPixel / space.scale
+    if thinnest <= half {
+        result.halfLineWidth = half
+        return result
+    }
+    result.halfLineWidth = thinnest
+    result.alpha = primitive.lineWidth * space.scale
+    return result
+}
+
+// set_primitive_rect: the quad's unit square into clip space, and every
+// length into units of the quad's height, the shader's local space.
+function placed(
+    globals: PrimitiveGlobals,
+    rect: borrow Rect,
+    space: borrow PrimitiveSpace
+) -> PrimitiveGlobals {
+    var result = move globals
+    let t = space.transform
+    let sx = 2 / space.target.width
+    let sy = 2 / space.target.height
+    let unit = 1 / rect.height
+    result.columnX = Point { x: sx * t.a * rect.width, y: -sy * t.b * rect.width }
+    result.columnY = Point { x: sx * t.c * rect.height, y: -sy * t.d * rect.height }
+    result.translation = Point {
+        x: sx * (t.tx + t.a * rect.x + t.c * rect.y) - 1,
+        y: 1 - sy * (t.ty + t.b * rect.x + t.d * rect.y)
+    }
+    result.horizontalScale = rect.width * unit
+    result.halfSize = Size {
+        width: result.halfSize.width * unit,
+        height: result.halfSize.height * unit
+    }
+    result.halfLineWidth = result.halfLineWidth * unit
+    result.distanceScale = result.distanceScale * rect.height
+    result.radii = scaledRadii(result.radii, result.shapeType, unit)
+    return result
+}
+
+// The radii each type reads: one for the uniform corners, four for the
+// per-corner types, and the meeting type's radius and reach.
+function scaledRadii(
+    radii: borrow CornerRadii,
+    shapeType: PrimitiveType,
+    unit: Number
+) -> CornerRadii {
+    let result = copy radii
+    let firstOnly = CornerRadii {
+        topLeft: radii.topLeft * unit,
+        topRight: radii.topRight,
+        bottomRight: radii.bottomRight,
+        bottomLeft: radii.bottomLeft
+    }
+    let all = CornerRadii {
+        topLeft: radii.topLeft * unit,
+        topRight: radii.topRight * unit,
+        bottomRight: radii.bottomRight * unit,
+        bottomLeft: radii.bottomLeft * unit
+    }
+    return match shapeType {
+        Empty -> result
+        Infinite -> result
+        Rect -> result
+        PixelRect -> result
+        RoundedRect -> firstOnly
+        ContinuousRoundedRect -> firstOnly
+        Circle -> firstOnly
+        CornerRoundedRect -> all
+        CornerContinuousRect -> all
+        OverlappingCornerRect -> all
+        OverlappingCornerContinuousRect -> all
+        MeetingContinuousRect -> CornerRadii {
+            topLeft: radii.topLeft * unit,
+            topRight: radii.topRight * unit,
+            bottomRight: radii.bottomRight,
+            bottomLeft: radii.bottomLeft
+        }
+    }
+}

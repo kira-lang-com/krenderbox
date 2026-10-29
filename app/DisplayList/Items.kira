@@ -1,0 +1,69 @@
+import Foundation
+
+// A shape as it was when it was drawn or clipped to: RenderBox copies a
+// shape's data into the item, so changing the shape afterwards changes
+// nothing already recorded.
+public struct ShapeSnapshot {
+    let data: ShapeData
+    let fillRule: FillRule
+    let renderingMode: RenderingMode
+    let renderingModeArgument: Number
+}
+
+public struct ShapeClip {
+    let shape: ShapeSnapshot
+    let transform: AffineTransform
+    let alpha: Number
+    let mode: ClipMode
+}
+
+public struct LayerClip {
+    let contents: LayerContents
+    let alpha: Number
+    let mode: ClipMode
+}
+
+// RB::DisplayList::Clip: what the state limits drawing to.
+public enum Clip {
+    Shape(ShapeClip)
+    Layer(LayerClip)
+}
+
+// RB::DisplayList::State as an item keeps it.
+public struct DrawingState {
+    var transform: AffineTransform = AffineTransform()
+    var clips: [Clip] = []
+    var styles: [Style] = []
+    // How many clips each style was added after: RB's Style keeps the clip
+    // node it was added under, and only those clip what the style made.
+    var styleClipCounts: [UNumber] = []
+    var contentHeadroom: Number = 0
+}
+
+public struct ShapeItem {
+    let shape: ShapeSnapshot
+    let fill: FillData
+    let headroom: Number = 0
+    let alpha: Number
+    let blendMode: BlendMode
+    let state: DrawingState
+}
+
+public struct LayerItem {
+    let contents: LayerContents
+    let alpha: Number
+    let blendMode: BlendMode
+    let state: DrawingState
+}
+
+// RB::DisplayList::Item.
+public enum Item {
+    Shape(ShapeItem)
+    Layer(LayerItem)
+}
+
+// RB::DisplayList::Layer: items drawn together, then composited as one.
+public struct LayerContents {
+    var flags: LayerFlags = LayerFlags.none
+    var items: [Item] = []
+}

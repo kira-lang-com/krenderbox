@@ -1,0 +1,337 @@
+import Foundation
+
+// RB::(anon)::StrokeLines: the LineConsumer that turns a flattened stroke
+// into the RB::Shader::StrokeLinePoint buffer `Shaders/StrokeLines.ksl`
+// draws. Every subpath starts with a pad point one start tangent before its
+// start and, when open, ends with one an end tangent past its end; between
+// subpaths a gap point keeps the shader from joining them.
+
+// What a point's flags say besides its join.
+namespace StrokeMark {
+    // The pad point before a start or after an end: its end is capped.
+    let pad: Number = -3
+    // The point a butt cap is cut back from.
+    let buttEnd: Number = -2
+    // A point no segment reaches: a gap, or a closed subpath's neighbour.
+    let gap: Number = -1
+}
+
+// RB::Stroke::LineJoin as the shader reads it.
+namespace StrokeJoin {
+    let miter: Number = 0
+    let round: Number = 1
+    let bevel: Number = 2
+}
+
+// RB::Stroke::Point: what a point carries besides its position.
+struct StrokeAttributes {
+    var halfWidth: Number = 0
+    var alpha: Number = 1
+}
+
+// RB::Shader::StrokeLinePoint.
+struct StrokePoint {
+    var position: Point = Point()
+    var attributes: StrokeAttributes = StrokeAttributes()
+    var flags: Number = 0
+}
+
+struct StrokeLines {
+    var points: [StrokePoint] = []
+    let cap: LineCap
+    let miterLimit: Number
+    // Stroke space to device pixels, how far a half width reaches in device
+    // pixels along each axis, and the shortest butt cut worth making.
+    let toDevice: AffineTransform
+    let reach: Point
+    let shortestCut: Number
+    var low: Point = Point()
+    var high: Point = Point()
+    var bounded: Bool = false
+    var varyingAlpha: Bool = false
+    var hasJoins: Bool = false
+    // The subpath being built: its start, its first point's index and how
+    // many points it has.
+    var start: Point = Point()
+    var startAttributes: StrokeAttributes = StrokeAttributes()
+    var atStart: Bool = false
+    var first: Number = -1
+    var count: Number = 0
+    var skipping: Bool = false
+    var skipPosition: Point = Point()
+    var skipAttributes: StrokeAttributes = StrokeAttributes()
+    var startTangent: Point = Point()
+    var endTangent: Point = Point()
+}
+
+extend StrokeLines {
+    function moveTo(borrow mut self, position: Point, attributes: StrokeAttributes) {
+        finishSubpath(false, StrokeJoin.round)
+        start = position
+        startAttributes = attributes
+        atStart = true
+        skipping = false
+    }
+
+    function skipTo(borrow mut self, position: Point, attributes: StrokeAttributes) {
+        atStart = false
+        skipping = true
+        skipPosition = position
+        skipAttributes = attributes
+    }
+
+    function tangent(borrow mut self, direction: Point, end: Bool) {
+        if end {
+            endTangent = direction
+        } else {
+            startTangent = direction
+        }
+    }
+
+    function closePath(borrow mut self, join: Number) {
+        finishSubpath(true, join)
+    }
+
+    function lineTo(borrow mut self, position: Point, attributes: StrokeAttributes, join: Number) {
+        if atStart {
+            beginSubpath(position, attributes)
+        }
+        if skipping {
+            addPoint(Point(), StrokeAttributes { halfWidth: 0, alpha: 1 }, StrokeMark.gap)
+            addPoint(copy skipPosition, copy skipAttributes, StrokeJoin.round)
+            skipping = false
+        }
+        addPoint(move position, move attributes, join)
+    }
+
+    // The pad and the start, then for a butt cap the point the start's cut
+    // ends at.
+    function beginSubpath(
+        borrow mut self,
+        toward: borrow Point,
+        attributes: borrow StrokeAttributes
+    ) {
+        addPoint(minus(start, startTangent), copy startAttributes, StrokeMark.pad)
+        first = points.count - 1
+        addPoint(copy start, copy startAttributes, StrokeJoin.round)
+        atStart = false
+        if skipping || cap != .Butt {
+            return
+        }
+        let along = minus(toward, start)
+        let span = length(along)
+        let cut = buttCut(normalized(startTangent), normalized(along), span)
+        if cut <= 0 {
+            return
+        }
+        let at = points.count - 1
+        points[at].flags = StrokeMark.buttEnd
+        hasJoins = true
+        let direction = normalized(along)
+        addPoint(
+            Point { x: start.x + direction.x * cut, y: start.y + direction.y * cut },
+            mixedAttributes(startAttributes, attributes, cut / span),
+            StrokeJoin.bevel
+        )
+    }
+
+    // How far back a butt cap's corner reaches along a segment of `span`
+    // going `along` from a tangent `tangent`: the start's half width times the
+    // tangent of the angle between them, when that falls inside the segment.
+    function buttCut(tangent: borrow Point, along: borrow Point, span: Number) -> Number {
+        let dot = along.x * tangent.x + along.y * tangent.y
+        if dot == 0 {
+            return 0
+        }
+        let cut = abs(startAttributes.halfWidth * (along.y * tangent.x - along.x * tangent.y) / dot)
+        if cut > shortestCut && cut < span {
+            return cut
+        }
+        return 0
+    }
+
+    // add_point: a point, unless it repeats the last one, growing the device
+    // bounds by its reach.
+    function addPoint(
+        borrow mut self,
+        position: Point,
+        attributes: StrokeAttributes,
+        flags: Number
+    ) {
+        if attributes.halfWidth > 0 && flags != StrokeMark.pad {
+            if count != 0 && samePoint(points[points.count - 1].position, position) {
+                return
+            }
+            grow(position, attributes, flags)
+        }
+        if flags == StrokeMark.buttEnd || flags == StrokeJoin.miter || flags == StrokeJoin.bevel {
+            hasJoins = true
+        }
+        points.append(StrokePoint { position: position, attributes: attributes, flags: flags })
+        count += 1
+    }
+
+    function grow(
+        borrow mut self,
+        position: borrow Point,
+        attributes: borrow StrokeAttributes,
+        flags: Number
+    ) {
+        let scale = flags == StrokeJoin.miter ? miterLimit : 1
+        let x = reach.x * attributes.halfWidth * scale
+        let y = reach.y * attributes.halfWidth * scale
+        let device = toDevice.applying(position)
+        if !bounded {
+            low = Point { x: device.x - x, y: device.y - y }
+            high = Point { x: device.x + x, y: device.y + y }
+            bounded = true
+        }
+        low = Point { x: min(low.x, device.x - x), y: min(low.y, device.y - y) }
+        high = Point { x: max(high.x, device.x + x), y: max(high.y, device.y + y) }
+        if attributes.alpha != 1 {
+            varyingAlpha = true
+        }
+    }
+}
+
+extend StrokeLines {
+    // finish_subpath: a lone start drawn as a dot when its cap shows, then
+    // an open subpath's end capped or a closed one wrapped around.
+    function finishSubpath(borrow mut self, closed: Bool, join: Number) {
+        if count == 0 {
+            reset()
+            return
+        }
+        if count == 2 && cap != .Butt {
+            repeatLast(1)
+        } else if count == 1 {
+            if cap != .Round {
+                let _ = points.popLast()
+                reset()
+                return
+            }
+            repeatLast(2)
+        }
+        if closed && first >= 0 {
+            wrap(join)
+        } else {
+            endOpen(closed)
+        }
+        reset()
+    }
+
+    function reset(borrow mut self) {
+        count = 0
+        first = -1
+    }
+
+    // The last point again, `times` times, as a round join.
+    function repeatLast(borrow mut self, times: Number) {
+        var last = copy points[points.count - 1]
+        last.flags = StrokeJoin.round
+        for _ in 0..times {
+            points.append(copy last)
+            count += 1
+        }
+    }
+
+    // An open end: its butt cap cut back, then the pad past it.
+    function endOpen(borrow mut self, closed: Bool) {
+        let at = points.count - 1
+        points[at].flags = StrokeJoin.round
+        if !closed && !skipping && cap == .Butt {
+            cutEnd(at)
+        }
+        let last = copy points[at]
+        points.append(
+            StrokePoint {
+                position: plus(last.position, endTangent),
+                attributes: copy last.attributes,
+                flags: StrokeMark.pad
+            }
+        )
+    }
+
+    // The end at `at` moved back to where its butt cap's corner reaches, and
+    // the end itself kept after it to cut to.
+    function cutEnd(borrow mut self, at: Number) {
+        let end = copy points[at]
+        let before = points[at - 1].position
+        let along = minus(end.position, before)
+        let span = length(along)
+        let cut = buttCut(normalized(endTangent), normalized(along), span)
+        if cut <= 0 {
+            return
+        }
+        let direction = normalized(along)
+        points[at].position = Point {
+            x: end.position.x - direction.x * cut,
+            y: end.position.y - direction.y * cut
+        }
+        points[at].attributes = mixedAttributes(
+            end.attributes,
+            points[at - 1].attributes,
+            cut / span
+        )
+        points[at].flags = StrokeJoin.bevel
+        hasJoins = true
+        points.append(
+            StrokePoint {
+                position: end.position,
+                attributes: end.attributes,
+                flags: StrokeMark.buttEnd
+            }
+        )
+    }
+
+    // A closed subpath: its pad replaced by the point before the end, which
+    // repeats the start, and the point after the start added after the end,
+    // both as neighbours no segment reaches; the start joins by `join`.
+    function wrap(borrow mut self, join: Number) {
+        var at = first
+        if points[at + 1].flags == StrokeMark.buttEnd {
+            points[at + 2] = copy points[at + 1]
+            points[at + 1] = copy points[at]
+            points[at].flags = StrokeMark.gap
+            at += 1
+        }
+        let end = points.count
+        points[at] = copy points[end - 2]
+        points[at].flags = StrokeMark.gap
+        points[at + 1].flags = join
+        if join != StrokeJoin.round {
+            hasJoins = true
+        }
+        var after = copy points[at + 2]
+        after.flags = StrokeMark.gap
+        points.append(move after)
+    }
+}
+
+function mixedAttributes(
+    from: borrow StrokeAttributes,
+    to: borrow StrokeAttributes,
+    amount: Number
+) -> StrokeAttributes {
+    return StrokeAttributes {
+        halfWidth: from.halfWidth + (to.halfWidth - from.halfWidth) * amount,
+        alpha: from.alpha + (to.alpha - from.alpha) * amount
+    }
+}
+
+function minus(a: borrow Point, b: borrow Point) -> Point {
+    return Point { x: a.x - b.x, y: a.y - b.y }
+}
+
+function plus(a: borrow Point, b: borrow Point) -> Point {
+    return Point { x: a.x + b.x, y: a.y + b.y }
+}
+
+// The vector scaled to unit length; a zero vector stays zero.
+function normalized(vector: borrow Point) -> Point {
+    let size = length(vector)
+    if size == 0 {
+        return Point()
+    }
+    return Point { x: vector.x / size, y: vector.y / size }
+}

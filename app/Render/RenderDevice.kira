@@ -1,0 +1,135 @@
+import Foundation
+import Ember
+
+// RBDevice: a GPU device kept open across renders, so that what one render
+// draws can be an image another draws from. Each render opens a session on
+// it; the textures renders hand back stay until they are released or the
+// device closes.
+public class RenderDevice {
+    var device: GraphicsHeadless
+    let resources: SessionResources
+    var kept: [GraphicsTexture] = []
+}
+
+public function openRenderDevice() -> Result<RenderDevice, RenderFailure> {
+    var device = match openHeadlessGraphicsWithBackend(.Dawn) {
+        Ok(device) -> device
+        Error(failure) -> return .Error(.Device(failure))
+    }
+    let resources = match sessionResources(device.graphics()) {
+        Ok(resources) -> resources
+        Error(failure) -> {
+            device.close()
+            return .Error(.Resource(failure))
+        }
+    }
+    return .Ok(RenderDevice { device: device, resources: resources })
+}
+
+extend RenderDevice {
+    // `contents` drawn over `clear` into a `width` by `height` texture of
+    // `format` whose colours are in `colorSpace`, kept on the device. A
+    // device colour space is RBDrawable's default working space.
+    function render(
+        borrow mut self,
+        contents: borrow LayerContents,
+        width: UN32,
+        height: UN32,
+        clear: borrow RGBAColor,
+        format: PixelFormat,
+        colorSpace: ColorSpace
+    ) -> Result<TextureImage, RenderFailure> {
+        let space = workingSpace(colorSpace, format)
+        var session = deviceSession(self, width, height, textureFormat(format), space)
+        let drawn = keptTarget(session, contents, clear)
+        // The session's surfaces are freed only once the GPU has drawn with
+        // them, so closing waits for the queue to drain first.
+        session.device.finish()
+        closeSession(session)
+        let texture = try drawn
+        kept.append(copy texture)
+        return .Ok(TextureImage { texture: texture, width: width, height: height })
+    }
+
+    // RBImage's last reference dropped: `image`'s texture is released once
+    // the passes already submitted have drawn from it.
+    function release(borrow mut self, image: TextureImage) {
+        var still: [GraphicsTexture] = []
+        for texture in kept {
+            if texture.id != image.texture.id { still.append(copy texture) }
+        }
+        kept = still
+        device.graphics().destroyTexture(image.texture)
+    }
+
+    // The image's texels, rows top to bottom: a half-float image's channels
+    // as little-endian halves.
+    function read(borrow mut self, image: borrow TextureImage) -> Result<[UN8], RenderFailure> {
+        return match readTextureRows(device.graphics(), image.texture, 0, image.height) {
+            Ok(bytes) -> .Ok(bytes)
+            Error(failure) -> .Error(.Readback(failure))
+        }
+    }
+
+    function close(borrow mut self) {
+        let graphics = device.graphics()
+        for texture in kept {
+            graphics.destroyTexture(texture)
+        }
+        kept = []
+        graphics.destroyBindGroup(resources.noDestination)
+        graphics.destroyBuffer(resources.transfer)
+        graphics.destroyShader(copy resources.shader)
+        graphics.destroyTexture(resources.white)
+        graphics.destroySampler(resources.sampler)
+        graphics.destroySampler(resources.nearest)
+        graphics.destroyTexture(resources.noise)
+        graphics.destroySampler(resources.tiling)
+        device.close()
+    }
+}
+
+// A session drawing with the device's shared resources, which it leaves
+// open when it closes.
+function deviceSession(
+    owner: borrow RenderDevice,
+    width: UN32,
+    height: UN32,
+    format: TextureFormat,
+    colorSpace: Number
+) -> RenderSession {
+    let shared = owner.resources
+    return RenderSession {
+        device: owner.device,
+        width: width,
+        height: height,
+        format: format,
+        colorSpace: colorSpace,
+        shader: copy shared.shader,
+        white: copy shared.white,
+        sampler: copy shared.sampler,
+        nearest: copy shared.nearest,
+        noise: copy shared.noise,
+        tiling: copy shared.tiling,
+        noDestination: copy shared.noDestination,
+        transfer: copy shared.transfer,
+        ownsDevice: false
+    }
+}
+
+// The session's contents drawn into a surface the session does not release.
+function keptTarget(
+    session: borrow mut RenderSession,
+    contents: borrow LayerContents,
+    clear: borrow RGBAColor
+) -> Result<GraphicsTexture, RenderFailure> {
+    let descriptor = surfaceDescriptor(session, Number(session.width), Number(session.height))
+    let target = try takenSurface(session, move descriptor)
+    match renderContents(session, contents, target.texture, clear, .None) {
+        Ok -> return .Ok(target.texture)
+        Error(failure) -> {
+            session.idle.append(move target)
+            return .Error(failure)
+        }
+    }
+}

@@ -1,0 +1,69 @@
+import Foundation
+import Ember
+
+// RB::CustomEffect::render for a layer filter: the shader drawn over the
+// target, its point in user space and the layer its first argument.
+// CustomShader::Closure::marshal_layer_arg hands the layer over as its
+// texture, the map from user space to the texture's normalized coordinates,
+// as two columns and a translation, and the rectangle a read is clamped to,
+// the texture's less half a texel each side. The shader reads it with
+// RenderBox's linear, clamped sampler.
+function shaderFiltered(
+    session: borrow mut RenderSession,
+    source: GraphicsTexture,
+    style: borrow ShaderFilterStyle,
+    opacity: Number
+) -> Result<(GraphicsTexture, Number), RenderFailure> {
+    // Colour and warp filters, the flags past the kind, and a border that
+    // bounds the output by the layer's extent are not ported.
+    if style.flags.raw != ShaderFilterFlags.layer.raw || bordered(style.border) {
+        return .Error(.UnportedStyle)
+    }
+    // AffineTransform::invert leaves a transform it cannot invert as it is.
+    let toUser = try style.transform.inverted() otherwise copy style.transform
+    var start = PackedArguments {
+        floats: userFloats(toUser),
+        images: [TextureImage {
+            texture: copy source,
+            width: session.width,
+            height: session.height
+        }]
+    }
+    appendAligned(
+        start.floats,
+        layerFloats(session, style.transform),
+        ShaderFillDrawing.pairAlignment
+    )
+    let arguments = try packedAfter(session, style.shader, move start)
+    let pipeline = try functionPipeline(session, style.shader)
+    let bindGroup = try boundArguments(session, arguments)
+    let target = try surface(session, "renderbox-shader-filter")
+    let draw = RecordedDraw {
+        pipeline: pipeline,
+        bindGroup: bindGroup,
+        vertexCount: ShaderFillDrawing.vertexCount
+    }
+    try drawPass(session, target, Surfaces.transparent, [draw])
+    return .Ok((target, opacity))
+}
+
+function bordered(border: borrow FilterBorder) -> Bool {
+    return match border {
+        Unbounded -> false
+        Bounded(border) -> true
+    }
+}
+
+// marshal_layer_arg's five float2s: user space to the layer's normalized
+// coordinates, then the lowest and highest point read.
+function layerFloats(session: borrow RenderSession, toDevice: borrow AffineTransform) -> [Number] {
+    let width = Number(session.width)
+    let height = Number(session.height)
+    let normalized = toDevice.concatenating(AffineTransform { a: 1 / width, d: 1 / height })
+    let halfX = 0.5 / width
+    let halfY = 0.5 / height
+    return [
+        normalized.a, normalized.b, normalized.c, normalized.d, normalized.tx, normalized.ty,
+        halfX, halfY, 1 - halfX, 1 - halfY
+    ]
+}

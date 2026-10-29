@@ -1,0 +1,165 @@
+import Foundation
+import RenderBox
+
+// How far a dithered byte may be from the gradient's exact value: the
+// noise moves it by up to one either way.
+namespace GradientTolerance {
+    let bytes: Number = 2
+}
+
+function grayStop(level: Number, location: Number) -> GradientStop {
+    return GradientStop {
+        color: RGBAColor { r: level, g: level, b: level, a: 1 },
+        location: location
+    }
+}
+
+// The whole target filled with `gradient`, rendered on the GPU.
+function gradientPixels(gradient: Gradient) -> Result<[UN8], RenderFailure> {
+    var list = DisplayList()
+    var fill = Fill()
+    fill.setGradient(move gradient)
+    var shape = Shape()
+    shape.setRect(Rect { x: 0, y: 0, width: 8, height: 8 })
+    list.drawShape(shape, fill, 1, .Normal)
+    return renderLayer(
+        list.moveContents(),
+        RenderTarget.side,
+        RenderTarget.side,
+        RenderTarget.clear
+    )
+}
+
+// "ok" when every pixel's red byte is within the tolerance of its expected
+// level, otherwise what each one was.
+function nearLevels(
+    pixels: borrow Result<[UN8], RenderFailure>,
+    at: borrow [Point],
+    levels: borrow [Number]
+) -> String {
+    let bytes = match pixels {
+        Ok(bytes) -> bytes
+        Error(failure) -> return "failed \(failure)"
+    }
+    var report = ""
+    var near = true
+    for (index, point) in at.enumerated() {
+        let red = Number(bytes[(point.y * RenderTarget.side + point.x) * 4])
+        if abs(red - levels[index] * 255) > GradientTolerance.bytes {
+            near = false
+        }
+        report = "\(report) \(red)"
+    }
+    return near ? "ok" : report
+}
+
+function grayGradient(
+    geometry: GradientGeometry,
+    stops: [GradientStop],
+    interpolation: GradientInterpolation
+) -> Gradient {
+    return Gradient {
+        geometry: geometry,
+        stops: stops,
+        colorSpace: .StandardRgb,
+        edgeMode: .Clamp,
+        interpolation: interpolation
+    }
+}
+
+// Two evenly spaced stops mix linearly along the axis.
+@Test
+function axialGradientRunsAlongTheAxis() {
+    expect!(axialGradientRunsAlongTheAxisResult() == "ok")
+}
+
+function axialGradientRunsAlongTheAxisResult() -> String {
+    let axial = AxialGradient { startPoint: Point { x: 0, y: 0 }, endPoint: Point { x: 8, y: 0 } }
+    let gradient = grayGradient(.Axial(axial), [grayStop(0, 0), grayStop(1, 1)], .Linear)
+    let pixels = gradientPixels(move gradient)
+    return nearLevels(
+        pixels,
+        [Point { x: 0, y: 2 }, Point { x: 3, y: 5 }, Point { x: 7, y: 7 }],
+        [0.0625, 0.4375, 0.9375]
+    )
+}
+
+// Stops away from even spacing are found by searching their locations.
+@Test
+function unevenStopsAreSearched() {
+    expect!(unevenStopsAreSearchedResult() == "ok")
+}
+
+function unevenStopsAreSearchedResult() -> String {
+    let axial = AxialGradient { startPoint: Point { x: 0, y: 0 }, endPoint: Point { x: 8, y: 0 } }
+    let stops = [grayStop(0, 0), grayStop(1, 0.25), grayStop(0.5, 1)]
+    let pixels = gradientPixels(grayGradient(.Axial(axial), move stops, .Linear))
+    // Centres at 0.1875, 0.5625 and 0.9375 of the axis.
+    return nearLevels(
+        pixels,
+        [Point { x: 1, y: 0 }, Point { x: 4, y: 0 }, Point { x: 7, y: 0 }],
+        [0.75, 0.7916667, 0.5416667]
+    )
+}
+
+// A conic turns from its angle towards positive y, all the way round.
+@Test
+function conicGradientTurnsFromItsAngle() {
+    expect!(conicGradientTurnsFromItsAngleResult() == "ok")
+}
+
+function conicGradientTurnsFromItsAngleResult() -> String {
+    let conic = ConicGradient { center: Point { x: 4, y: 4 }, angle: 0 }
+    let pixels = gradientPixels(
+        grayGradient(.Conic(conic), [grayStop(0, 0), grayStop(1, 1)], .Linear)
+    )
+    // atan2 of each centre from (4, 4): 0.1419, 2pi - 0.1419, pi - 0.1419.
+    return nearLevels(
+        pixels,
+        [Point { x: 7, y: 4 }, Point { x: 7, y: 3 }, Point { x: 0, y: 4 }],
+        [0.0225836, 0.9774164, 0.4774164]
+    )
+}
+
+// A radial from a point grows with the distance from its centre.
+@Test
+function radialGradientGrowsOutwards() {
+    expect!(radialGradientGrowsOutwardsResult() == "ok")
+}
+
+function radialGradientGrowsOutwardsResult() -> String {
+    let radial = RadialGradient {
+        startCenter: Point { x: 4, y: 4 },
+        startRadius: 0,
+        endCenter: Point { x: 4, y: 4 },
+        endRadius: 4
+    }
+    let pixels = gradientPixels(
+        grayGradient(.Radial(radial), [grayStop(0, 0), grayStop(1, 1)], .Linear)
+    )
+    return nearLevels(
+        pixels,
+        [Point { x: 4, y: 4 }, Point { x: 0, y: 4 }, Point { x: 7, y: 7 }],
+        [0.1767767, 0.8838835, 1]
+    )
+}
+
+// Smooth stops run along a cubic that meets each stop. The ends have no
+// neighbour, so the curve leaves the first stop and reaches the last one
+// flat: (0.5)(3f^2 - 2f^3) on the first half, 0.5 + 0.5f + 0.5f^2 - 0.5f^3
+// on the second.
+@Test
+function smoothStopsMeetEachStop() {
+    expect!(smoothStopsMeetEachStopResult() == "ok")
+}
+
+function smoothStopsMeetEachStopResult() -> String {
+    let axial = AxialGradient { startPoint: Point { x: 0, y: 0 }, endPoint: Point { x: 8, y: 0 } }
+    let stops = [grayStop(0, 0), grayStop(0.5, 0.5), grayStop(1, 1)]
+    let pixels = gradientPixels(grayGradient(.Axial(axial), move stops, .Smooth))
+    return nearLevels(
+        pixels,
+        [Point { x: 0, y: 0 }, Point { x: 3, y: 0 }, Point { x: 6, y: 0 }],
+        [0.0214844, 0.4785156, 0.8857422]
+    )
+}

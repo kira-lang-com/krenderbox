@@ -1,0 +1,293 @@
+// RenderBox's filter_distance_fragment: one pass of RB::Filter::Distance's
+// multipass render, chosen by the mode, state word 0 bits 16 to 19.
+//
+//  0  the destination's alpha thresholded at a half, antialiased
+//  1  the destination's alpha in every channel
+//  2  the jump flood's seeds: from the source's alpha around each pixel, the
+//     vector to the edge through it, or none
+//  3  a jump flood step: the nearest seed of the pixel and its eight
+//     neighbours `step` away
+//  4  the last step, which also slides a near seed along its edge
+//  5  the source's vectors as a distance, signed by the destination's alpha
+//  6  the destination's vectors as a distance, signed by the source's alpha:
+//     red the distance less the map's offset, green the distance
+//  9  the gradient of the source's red, with its green as the value
+// 10  the same, with the destination's red as the value
+//
+// RenderBox reads the destination from the tile it draws into; here it is a
+// texture of its own. Texel coordinates are pixels, read at the nearest
+// texel and clamped to the edge as RB's sampler is.
+
+type DistanceGlobals {
+    // From the target's pixel to the source's.
+    let offset: Float2
+    // The pixels a neighbour is read from: outside, it counts for nothing.
+    let low: Float2
+    let high: Float2
+    // A distance to its stored value: times x, plus y.
+    let map: Float2
+    let step: Float
+    let mode: Float
+    // The source's and the destination's size, for clamping.
+    let sourceSize: Float2
+    let destinationSize: Float2
+}
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+}
+
+type FragmentOut {
+    let color: Half4
+}
+
+// A vector RB stores for a pixel no seed has reached: the half's largest.
+function noSeed() -> Float4 {
+    return Float4(65504.0, 65504.0, 0.0, 0.0)
+}
+
+function inside(point: Float2, g: DistanceGlobals) -> Bool {
+    return point.x >= g.low.x && point.x <= g.high.x && point.y >= g.low.y && point.y <= g.high.y
+}
+
+shader Distance {
+    group Filter {
+        uniform globals: DistanceGlobals
+        texture source: Texture2d
+        texture destination: Texture2d
+        texture table: Texture2d
+        sampler tableSampler: Sampler
+    }
+
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        function entry(input: VertexIn) -> VertexOut {
+            let corner = input.vid
+            if input.vid == UInt(3) {
+                corner = UInt(0)
+            }
+            if input.vid > UInt(3) {
+                corner = input.vid - UInt(2)
+            }
+            let x = -1.0
+            if corner == UInt(1) || corner == UInt(2) {
+                x = 1.0
+            }
+            let y = 1.0
+            if corner > UInt(1) {
+                y = -1.0
+            }
+            let out: VertexOut
+            out.clip_position = Float4(x, y, 0.0, 1.0)
+            return out
+        }
+    }
+
+    fragment {
+        input VertexOut
+        output FragmentOut
+
+        function sourceAt(point: Float2) -> Float4 {
+            let texel = clamp(floor(point), Float2(0.0, 0.0), globals.sourceSize - 1.0)
+            return load(source, texel)
+        }
+
+        function destinationAt(point: Float2) -> Float4 {
+            let texel = clamp(floor(point), Float2(0.0, 0.0), globals.destinationSize - 1.0)
+            return load(destination, texel)
+        }
+
+        // The source's alpha `delta` away, or nothing outside the bounds.
+        function alphaAt(point: Float2, delta: Float2) -> Float {
+            let at = point + delta
+            if inside(at, globals) {
+                return sourceAt(at).w
+            }
+            return 0.0
+        }
+
+        // Mode 0: the destination's alpha as coverage of its half contour.
+        function thresholded(position: Float2) -> Float4 {
+            let centred = destinationAt(position).w - 0.5
+            let slope = abs(Float2(dpdx(centred), dpdy(centred)))
+            let within = position.x > globals.low.x && position.x < globals.high.x
+            let withinY = position.y > globals.low.y && position.y < globals.high.y
+            let widthX = 0.0010004
+            let widthY = 0.0010004
+            if within {
+                widthX = slope.x
+            }
+            if withinY {
+                widthY = slope.y
+            }
+            let value = clamp(centred / (widthX + widthY) + 0.5, 0.0, 1.0)
+            return Float4(value, value, value, value)
+        }
+
+        // Mode 2: a pixel the source's edge crosses seeds the vector to it.
+        function seeded(point: Float2) -> Float4 {
+            let s = globals.step
+            let centre = sourceAt(point).w
+            let left = alphaAt(point, Float2(-s, 0.0))
+            let right = alphaAt(point, Float2(s, 0.0))
+            let up = alphaAt(point, Float2(0.0, -s))
+            let down = alphaAt(point, Float2(0.0, s))
+            let upLeft = alphaAt(point, Float2(-s, -s))
+            let upRight = alphaAt(point, Float2(s, -s))
+            let downLeft = alphaAt(point, Float2(-s, s))
+            let downRight = alphaAt(point, Float2(s, s))
+            let gx = (right * 2.0 + upRight + downRight) - (left * 2.0 + upLeft + downLeft)
+            let gy = (down * 2.0 + downLeft + downRight) - (up * 2.0 + upLeft + upRight)
+            let gradient = Float2(gx, gy)
+            let length2 = dot(gradient, gradient)
+            let normal = gradient
+            if length2 != 0.0 {
+                normal = gradient * (1.0 / sqrt(length2))
+            }
+            let edge = length2 > 15.0
+            if !edge {
+                edge = length2 > 0.5 && centre > 0.0026035 && centre < 0.99756
+            }
+            if !edge {
+                return noSeed()
+            }
+            let magnitude = abs(normal)
+            let ratio = min(magnitude.x, magnitude.y) / max(magnitude.x, magnitude.y)
+            // Device::distance_texture: by coverage across, and down by the
+            // ratio of the normal's smaller part to its larger.
+            let distance = sample(table, tableSampler, Float2(centre, ratio)).x
+            return Float4(normal * distance, 0.0, 0.0)
+        }
+
+        // A neighbour's seed as a vector from this pixel, when nearer.
+        function nearer(best: Float3, point: Float2, delta: Float2) -> Float3 {
+            let at = point + delta
+            if !inside(at, globals) {
+                return best
+            }
+            let vector = sourceAt(at).xy + delta
+            let length2 = dot(vector, vector)
+            if length2 < best.z {
+                return Float3(vector, length2)
+            }
+            return best
+        }
+
+        // Modes 3 and 4: the jump flood's step.
+        function flooded(point: Float2) -> Float4 {
+            let s = globals.step
+            let own = sourceAt(point).xy
+            let best = Float3(own, dot(own, own))
+            best = nearer(best, point, Float2(0.0, -s))
+            best = nearer(best, point, Float2(-s, 0.0))
+            best = nearer(best, point, Float2(s, 0.0))
+            best = nearer(best, point, Float2(0.0, s))
+            best = nearer(best, point, Float2(-s, -s))
+            best = nearer(best, point, Float2(s, -s))
+            best = nearer(best, point, Float2(-s, s))
+            best = nearer(best, point, Float2(s, s))
+            let vector = best.xy
+            if globals.mode == 4.0 && best.z < 4.0 {
+                vector = slid(point, vector)
+            }
+            return Float4(vector, 0.0, 0.0)
+        }
+
+        // Mode 4: a seed within two pixels moves along its edge's tangent to
+        // the point nearest this pixel.
+        function slid(point: Float2, vector: Float2) -> Float2 {
+            let edge = sourceAt(point + vector).xy
+            let normal = edge * (1.0 / sqrt(dot(edge, edge)))
+            let tangent = Float2(-normal.y, normal.x)
+            let along = dot(-vector, tangent)
+            if abs(along) < 1.0 {
+                return tangent * along + vector
+            }
+            return vector
+        }
+
+        // Modes 5 and 6: the vector's length, negative outside, mapped.
+        function measured(point: Float2) -> Float4 {
+            let vector = destinationAt(point).xy
+            let alpha = sourceAt(point).w
+            if globals.mode == 5.0 {
+                vector = sourceAt(point).xy
+                alpha = destinationAt(point).w
+            }
+            let length = sqrt(dot(vector, vector))
+            if alpha < 0.5 {
+                length = -length
+            }
+            let value = clamp(length * globals.map.x + globals.map.y, 0.0, 1.0)
+            if globals.mode == 5.0 {
+                return Float4(value, value, value, value)
+            }
+            return Float4(value - globals.map.y, value, 0.0, 0.0)
+        }
+
+        // Modes 9 and 10: the value, and the signed distance's gradient as a
+        // unit vector mapped into colour.
+        function graded(point: Float2) -> Float4 {
+            let s = globals.step
+            let value = destinationAt(point).x
+            if globals.mode == 9.0 {
+                value = sourceAt(point).y
+            }
+            let left = point + Float2(-s, 0.0)
+            let right = point + Float2(s, 0.0)
+            let up = point + Float2(0.0, -s)
+            let down = point + Float2(0.0, s)
+            let within = inside(left, globals) && inside(right, globals)
+            if value == 0.0 || !within || !inside(up, globals) || !inside(down, globals) {
+                return Float4(0.0, 0.0, 0.0, 0.0)
+            }
+            let gradient = Float2(
+                sourceAt(right).x - sourceAt(left).x,
+                sourceAt(down).x - sourceAt(up).x
+            )
+            if gradient.x != 0.0 || gradient.y != 0.0 {
+                gradient = gradient * (1.0 / sqrt(dot(gradient, gradient)))
+            }
+            let mapped = gradient * globals.map.x + globals.map.y
+            return Float4(value, mapped.x, mapped.y, 1.0)
+        }
+
+        function entry(input: VertexOut) -> FragmentOut {
+            let position = input.clip_position.xy
+            let point = position + globals.offset
+            let result: FragmentOut
+            let mode = globals.mode
+            if mode == 0.0 {
+                result.color = Half4(thresholded(position))
+                return result
+            }
+            if mode == 1.0 {
+                let alpha = destinationAt(position).w
+                result.color = Half4(Float4(alpha, alpha, alpha, alpha))
+                return result
+            }
+            if mode == 2.0 {
+                result.color = Half4(seeded(point))
+                return result
+            }
+            if mode == 3.0 || mode == 4.0 {
+                result.color = Half4(flooded(point))
+                return result
+            }
+            if mode == 5.0 || mode == 6.0 {
+                result.color = Half4(measured(point))
+                return result
+            }
+            result.color = Half4(graded(point))
+            return result
+        }
+    }
+}

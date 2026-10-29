@@ -1,0 +1,180 @@
+import Foundation
+
+// RB::Shader::MeshGradient::Patch: a bicubic tensor patch. `points` are its
+// sixteen control points row by row, row i running along u and column j
+// along v, so the corners are P0 (u0, v0) at 0, P1 (u0, v1) at 3, P2 (u1, v0)
+// at 12 and P3 (u1, v1) at 15. RenderBox keeps the corners as floats and
+// every other point as a half offset from its nearest corner. `colors` are
+// the corners' c0 to c3 in that order, or, when colour runs along cubics,
+// the colour tensor's sixteen entries laid out as `points` are.
+struct MeshPatch {
+    var points: [Point]
+    var colors: [RGBAColor]
+}
+
+// What make_patches committed: the patches the bounds kept, and the
+// flattest of them, PatchBuffer's bounds over rows and columns.
+struct MeshPatches {
+    var patches: [MeshPatch] = []
+    var flatness: Point = Point()
+}
+
+namespace MeshPatchFlags {
+    // PatchFlag 1: the interior points follow the edges, as a Coons patch's.
+    let coons: Number = 1
+    // 2 and 4: colour runs along cubics, its interior a Coons patch's.
+    let cubic: Number = 6
+}
+
+// The tensor's entry at row `i`, column `j`.
+function tensorIndex(i: Number, j: Number) -> Number {
+    return i * 4 + j
+}
+
+// The corner a point is stored as an offset from.
+function nearestCorner(index: Number) -> Number {
+    let row = trunc(index / 4) < 2 ? 0 : 3
+    let column = index % 4 < 2 ? 0 : 3
+    return tensorIndex(row, column)
+}
+
+function isInterior(index: Number) -> Bool {
+    let row = trunc(index / 4)
+    let column = index % 4
+    return row > 0 && row < 3 && column > 0 && column < 3
+}
+
+function isCorner(index: Number) -> Bool {
+    return nearestCorner(index) == index
+}
+
+function pointPlus(a: borrow Point, b: borrow Point) -> Point {
+    return Point { x: a.x + b.x, y: a.y + b.y }
+}
+
+function pointMinus(a: borrow Point, b: borrow Point) -> Point {
+    return Point { x: a.x - b.x, y: a.y - b.y }
+}
+
+function pointScaled(a: borrow Point, scale: Number) -> Point {
+    return Point { x: a.x * scale, y: a.y * scale }
+}
+
+// `point` as RenderBox stores it: an offset from `corner` in halves.
+function settledPoint(point: borrow Point, corner: borrow Point) -> Point {
+    let offset = pointMinus(point, corner)
+    return pointPlus(corner, Point { x: halfRounded(offset.x), y: halfRounded(offset.y) })
+}
+
+// A patch of sixteen points with its corners and every edge point given,
+// the interior ones left at the corners until commit_patch fills them.
+function edgePatch(corners: borrow [Point], edges: borrow [(Number, Point)]) -> [Point] {
+    var points: [Point] = []
+    for index in 0..16 {
+        points.append(copy corners[cornerSlot(nearestCorner(index))])
+    }
+    for (index, point) in edges {
+        points[index] = settledPoint(point, points[nearestCorner(index)])
+    }
+    return points
+}
+
+// P0 to P3's place among `corners`.
+function cornerSlot(index: Number) -> Number {
+    return match index {
+        0 -> 0
+        3 -> 1
+        12 -> 2
+        else -> 3
+    }
+}
+
+// commit_patch's Coons interior: each inner point from the edges round it,
+// (-4 p00 + 6 (p01 + p10) - 2 (p03 + p30) + 3 (p31 + p13) - p33) / 9 for the
+// one next to P0, and likewise for the others, by symmetry.
+function coonsInterior(points: borrow [Point]) -> [Point] {
+    var filled = copy points
+    for (i, j) in [(1, 1), (1, 2), (2, 1), (2, 2)] {
+        let near = coonsPoint(points, i == 1 ? 0 : 3, j == 1 ? 0 : 3)
+        filled[tensorIndex(i, j)] = settledPoint(near, points[nearestCorner(tensorIndex(i, j))])
+    }
+    return filled
+}
+
+// The inner point nearest the corner at row `ci`, column `cj`.
+function coonsPoint(points: borrow [Point], ci: Number, cj: Number) -> Point {
+    let near = coonsSum(points, ci, cj, [(0, 1), (1, 0)])
+    let far = coonsSum(points, ci, cj, [(0, 3), (3, 0)])
+    let across = coonsSum(points, ci, cj, [(3, 1), (1, 3)])
+    let corner = coonsSum(points, ci, cj, [(0, 0)])
+    let opposite = coonsSum(points, ci, cj, [(3, 3)])
+    return Point {
+        x: (-4 * corner.x + 6 * near.x - 2 * far.x + 3 * across.x - opposite.x) / 9,
+        y: (-4 * corner.y + 6 * near.y - 2 * far.y + 3 * across.y - opposite.y) / 9
+    }
+}
+
+// The sum of the points `steps` rows and columns in from the corner at row
+// `ci`, column `cj`.
+function coonsSum(
+    points: borrow [Point],
+    ci: Number,
+    cj: Number,
+    steps: borrow [(Number, Number)]
+) -> Point {
+    let di = ci == 0 ? 1 : -1
+    let dj = cj == 0 ? 1 : -1
+    var sum = Point()
+    for (i, j) in steps {
+        sum = pointPlus(sum, points[tensorIndex(ci + di * i, cj + dj * j)])
+    }
+    return sum
+}
+
+// commit_patch: a patch whose edges all fall outside `bounds` is dropped;
+// a kept one adds to how far from flat the patches are, the largest second
+// difference along any of its four edges.
+function commitPatch(committed: borrow mut MeshPatches, patch: MeshPatch, bounds: borrow Rect) {
+    if !boundsMeet(patch.points, bounds) {
+        return
+    }
+    for edge in 0..2 {
+        for start in 0..2 {
+            let across = secondDifference(patch.points, edge * 3, start, 4, 1)
+            let along = secondDifference(patch.points, edge * 3, start, 1, 4)
+            committed.flatness = Point {
+                x: max(committed.flatness.x, max(across.x, along.x)),
+                y: max(committed.flatness.y, max(across.y, along.y))
+            }
+        }
+    }
+    committed.patches.append(patch)
+}
+
+// |p0 - 2 p1 + p2| of the three points from row or column `line`.
+function secondDifference(
+    points: borrow [Point],
+    line: Number,
+    start: Number,
+    lineStride: Number,
+    stride: Number
+) -> Point {
+    let first = line * lineStride + start * stride
+    let p0 = points[first]
+    let p1 = points[first + stride]
+    let p2 = points[first + 2 * stride]
+    return Point { x: abs(p0.x - 2 * p1.x + p2.x), y: abs(p0.y - 2 * p1.y + p2.y) }
+}
+
+// Whether the box round the patch's edges meets `bounds`.
+function boundsMeet(points: borrow [Point], bounds: borrow Rect) -> Bool {
+    var low = copy points[0]
+    var high = copy points[0]
+    for (index, point) in points.enumerated() {
+        if isInterior(index) { continue }
+        low = Point { x: min(low.x, point.x), y: min(low.y, point.y) }
+        high = Point { x: max(high.x, point.x), y: max(high.y, point.y) }
+    }
+    let across = high.x >= bounds.minX() && low.x <= bounds.maxX()
+    return across && high.y >= bounds.minY() && low.y <= bounds.maxY()
+}

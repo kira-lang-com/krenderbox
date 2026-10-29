@@ -1,0 +1,210 @@
+import Foundation
+
+// RB::CubicIterator<float2>: a cubic from (0, 0) to (1, 1) through the
+// timing's points, stepped by forward differences in floats.
+struct TimingSteps {
+    var point: Point
+    var first: Point
+    var second: Point
+    let third: Point
+}
+
+namespace TimingCuts {
+    // subdivide_cubic_stops steps the curve in eighths and cuts a segment
+    // where every other step ends: four stops a segment.
+    let steps: Number = 8
+    let stops: Number = 4
+}
+
+// The float nearest `value`, as RenderBox's float steps round.
+function floatRounded(value: Number) -> Number {
+    return Number(F32(value))
+}
+
+function floatPoint(x: Number, y: Number) -> Point {
+    return Point { x: floatRounded(x), y: floatRounded(y) }
+}
+
+// CubicIterator's constructor: the cubic's coefficients b, c and a, then
+// its first three differences at one step.
+function timingSteps(timing: borrow StopTiming) -> TimingSteps {
+    let step = 1 / TimingCuts.steps
+    let b = floatPoint(3 * timing.x1, 3 * timing.y1)
+    let edge = floatPoint(timing.x2 - timing.x1, timing.y2 - timing.y1)
+    let c = floatPoint(3 * edge.x - b.x, 3 * edge.y - b.y)
+    let a = floatPoint(
+        1 - floatRounded(floatRounded(b.x) + c.x),
+        1 - floatRounded(floatRounded(b.y) + c.y)
+    )
+    let third = floatPoint(6 * a.x * step * step * step, 6 * a.y * step * step * step)
+    let curved = floatPoint(c.x * step * step, c.y * step * step)
+    let second = floatPoint(2 * curved.x + third.x, 2 * curved.y + third.y)
+    let early = floatPoint(b.x * step + curved.x, b.y * step + curved.y)
+    let first = floatPoint(a.x * step * step * step + early.x, a.y * step * step * step + early.y)
+    return TimingSteps { point: Point(), first: first, second: second, third: third }
+}
+
+extend TimingSteps {
+    // One forward difference step.
+    function stepped() -> TimingSteps {
+        return TimingSteps {
+            point: floatPoint(point.x + first.x, point.y + first.y),
+            first: floatPoint(first.x + second.x, first.y + second.y),
+            second: floatPoint(second.x + third.x, second.y + third.y),
+            third: copy third
+        }
+    }
+}
+
+// count_subdivided_cubic_stops' test: a segment is cut when it runs forward
+// along a timing that is not the straight line.
+function cutSegment(stops: borrow [GradientStop], index: Number) -> Bool {
+    if index + 1 >= stops.count {
+        return false
+    }
+    return stops[index + 1].location > stops[index].location && !stops[index].timing.straight()
+}
+
+// subdivide_cubic_stops: each cut segment as four curved ones, the colour
+// at each start the timing's height there and the midpoint where the
+// colour is halfway to the next start; every other stop kept, its
+// midpoint the middle.
+function subdividedStops(stops: borrow [GradientStop]) -> [GradientStop] {
+    var cut: [GradientStop] = []
+    for (index, stop) in stops.enumerated() {
+        if !cutSegment(stops, index) {
+            cut.append(GradientStop { color: copy stop.color, location: stop.location })
+            continue
+        }
+        cut.appendAll(segmentStops(stop, stops[index + 1]))
+    }
+    return cut
+}
+
+function segmentStops(stop: borrow GradientStop, next: borrow GradientStop) -> [GradientStop] {
+    let span = floatRounded(next.location - stop.location)
+    var steps = timingSteps(stop.timing)
+    var start = floatRounded(stop.location + span * steps.point.x)
+    var cut: [GradientStop] = []
+    for _ in 0..TimingCuts.stops {
+        let before = copy steps
+        let middle = before.stepped()
+        steps = middle.stepped()
+        let halfway = halfwayAlong(before, middle, steps.point)
+        let end = floatRounded(stop.location + span * steps.point.x)
+        cut.append(
+            GradientStop {
+                color: timingMix(stop.color, next.color, before.point.y),
+                location: start,
+                midpoint: cutMidpoint(move halfway, stop.location - start, span, end - start)
+            }
+        )
+        start = end
+    }
+    return cut
+}
+
+// The step's position where the timing is halfway from its start's height
+// to its end's, on the line through the half step it is in; a flat step
+// has none, RenderBox's division leaving it not a number.
+function halfwayAlong(
+    before: borrow TimingSteps,
+    middle: borrow TimingSteps,
+    end: borrow Point
+) -> Number? {
+    let half = floatRounded(floatRounded(end.y - before.point.y) * 0.5)
+    let target = floatRounded(half + before.point.y)
+    let mid = middle.point
+    if mid.y <= target {
+        let rise = floatRounded(end.y - mid.y)
+        if rise == 0 { return .None }
+        return .Some(floatRounded(mid.x + (target - mid.y) / rise * middle.first.x))
+    }
+    let rise = floatRounded(mid.y - before.point.y)
+    return .Some(floatRounded(before.point.x + half / rise * before.first.x))
+}
+
+// The midpoint as a fraction of the cut segment; where RenderBox's is not
+// a number its exponent is the largest, as a midpoint at the end gives.
+function cutMidpoint(along: Number?, offset: Number, span: Number, length: Number) -> Number {
+    let halfway = try along otherwise return 1
+    if length == 0 {
+        return 1
+    }
+    return floatRounded(floatRounded(offset + span * halfway) / length)
+}
+
+// Color::mix of the stop's colour to the next's at `t`, in halves: through
+// premultiplied colours when their alphas differ.
+function timingMix(from: borrow RGBAColor, to: borrow RGBAColor, t: Number) -> RGBAColor {
+    let towards = halfRounded(t)
+    let away = halfRounded(1 - t)
+    let premultiply = from.a != to.a
+    let a = premultiply ? premultipliedHalf(from) : copy from
+    let b = premultiply ? premultipliedHalf(to) : copy to
+    let mixed = RGBAColor {
+        r: halfRounded(halfRounded(b.r * towards) + a.r * away),
+        g: halfRounded(halfRounded(b.g * towards) + a.g * away),
+        b: halfRounded(halfRounded(b.b * towards) + a.b * away),
+        a: halfRounded(halfRounded(b.a * towards) + a.a * away)
+    }
+    if !premultiply || mixed.a == 0 || mixed.a == 1 {
+        return mixed
+    }
+    let inverse = halfRounded(1 / mixed.a)
+    return RGBAColor {
+        r: halfRounded(mixed.r * inverse),
+        g: halfRounded(mixed.g * inverse),
+        b: halfRounded(mixed.b * inverse),
+        a: mixed.a
+    }
+}
+
+function premultipliedHalf(color: borrow RGBAColor) -> RGBAColor {
+    return RGBAColor {
+        r: halfRounded(color.r * color.a),
+        g: halfRounded(color.g * color.a),
+        b: halfRounded(color.b * color.a),
+        a: color.a
+    }
+}
+
+// set_gradient_color's curve exponent for a stop: the power that takes its
+// midpoint to a half, -ln 2 / ln midpoint, as a half; the largest half from
+// a midpoint at or past the end, which holds the stop's colour.
+function curveExponent(midpoint: Number) -> Number {
+    if midpoint >= 1 {
+        return HalfFloat.maximum
+    }
+    if midpoint <= 0 {
+        return 0
+    }
+    return halfRounded(-1 / log2(midpoint))
+}
+
+// Gradient's constructor keeps a curve only when a midpoint is off its
+// evenly spaced segment's middle, and a cubic only when a timing is not the
+// straight line; either is otherwise linear.
+function constructedInterpolation(gradient: borrow Gradient) -> GradientInterpolation {
+    if gradient.interpolation == .Linear || gradient.interpolation == .Smooth {
+        return gradient.interpolation
+    }
+    let stops = gradient.stops
+    let step = stops.count > 1 ? 1 / (stops.count - 1) : 0
+    for index in 0..stops.count - 1 {
+        let stop = stops[index]
+        let next = stops[index + 1].location
+        let curved = match gradient.interpolation {
+            Curve -> {
+                let midpoint = stop.location + stop.midpoint * (next - stop.location)
+                abs(midpoint - step * (index + 0.5)) > GradientStopLimits.spacingTolerance
+            }
+            Cubic -> !stop.timing.straight()
+            Linear, Smooth -> false
+        }
+        if curved {
+            return gradient.interpolation
+        }
+    }
+    return .Linear
+}

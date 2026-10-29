@@ -1,0 +1,491 @@
+// RenderBox's gradient sampling: RB::Shader::sample_gradient and what it
+// calls. Every pixel of the target gets the gradient's colour at its point:
+// Gradient::value turns the point into a position along the gradient,
+// fold_value applies the edge mode, Gradient::color reads the stops there and
+// the colour is dithered with RenderBox's noise texture. The coverage
+// pipelines then paint the shape with this surface.
+//
+// RenderBox does this in half precision inside each coverage fragment; the
+// stops it reads were rounded to halves on the CPU and so are these.
+//
+// The alpha gradient, which a gradient map draws, takes its position from
+// a channel of the layer under it instead: alpha_effect_fragment's gradient
+// form reads the destination pixel, which here is the layer's surface,
+// sampled at the same pixel.
+
+type GradientGlobals {
+    // Device pixel to gradient space: x * matrix.xy + y * matrix.zw +
+    // translation.
+    let matrix: Float4
+    let translation: Float2
+    // RB::Shader::GradientGlobals::Geometry's three parameters.
+    let geometry: Float2
+    let swapped: Float
+    // The geometry and edge mode's code, RenderState bits 19 to 22.
+    let kind: Float
+    // 0 two colours, 1 or 2 stops found by binary search, 3 evenly spaced
+    // stops: bits 23 and 24.
+    let colorMode: Float
+    // 1 when colour runs between stops along cubics (bit 25).
+    let smooth: Float
+    // The two colours of the two-colour mode, premultiplied.
+    let color0: Float4
+    let color1: Float4
+    // The two-colour curve's exponent, or the evenly spaced stops' last
+    // index.
+    let scale: Float
+    // The stops a binary search runs over.
+    let count: Float
+    // 1 when each segment's position is raised to a power (bit 26).
+    let curve: Float
+    // 1 when the position is the layer's channel, as the alpha gradient's.
+    let fromLayer: Float
+    // AlphaEffectGlobals' scale and offset from the channel to the position.
+    let valueMap: Float2
+    // Device pixel to the layer's coordinates: one over the target's size.
+    let targetScale: Float2
+    // The channel, RenderState bits 6 to 8: red to alpha, else luminance.
+    let component: Float
+    // Gradient::color_out's steps, the fill state's bits 0 to 2: the table,
+    // colours all opaque, OKLab. Then the table's index.
+    let colorOut: Float
+    let table: Float
+}
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+}
+
+type FragmentOut {
+    let color: Half4
+}
+
+// Gradient::value's conic: RenderBox's polynomial for atan2, from the
+// positive x axis towards positive y, then the turn from the gradient's
+// angle.
+function conicValue(p: Float2, offset: Float, angle: Float) -> Float {
+    let sign = 1.0
+    if p.x < 0.0 {
+        sign = -1.0
+    }
+    let ratio = (p.x - sign * abs(p.y)) / max(0.0001, abs(p.x) + abs(p.y))
+    let squared = ratio * ratio
+    let base = -0.7853982
+    if p.x < 0.0 {
+        base = -2.3561945
+    }
+    let polynomial = ((-0.012341008 * squared + 0.086615875) * squared - 0.28227445) * squared + 0.9929561
+    let turned = polynomial * ratio + base
+    if p.y >= 0.0 {
+        turned = -turned
+    }
+    if turned < angle {
+        turned = turned + 6.2831855
+    }
+    return clamp(turned * 0.15915494 + offset, 0.0, 1.0)
+}
+
+// Gradient::value's two-point radial: the circle through the point between
+// the start and end circles, in the space set_gradient_geometry maps the
+// focal point to the origin and the end centre to (1, 0). Where no circle
+// reaches the point the value is zero.
+function twoPointValue(p: Float2, start: Float, radius: Float, swapped: Float) -> Float {
+    let negative = 1.0 - start < 0.0
+    let value = 0.0
+    if radius > 1.0 {
+        value = length(p) - p.x / radius
+    } else {
+        if radius < 1.0 {
+            let q = p.x * p.x - p.y * p.y
+            if q < 0.0 {
+                return 0.0
+            }
+            let root = sqrt(q)
+            if swapped != 0.0 || negative {
+                root = -root
+            }
+            value = root - p.x / radius
+            if value < 0.0 {
+                return 0.0
+            }
+        } else {
+            value = dot(p, p) / p.x
+            if value < 0.0 {
+                return 0.0
+            }
+        }
+    }
+    if negative {
+        value = -value
+    }
+    let t = half(value + start)
+    if swapped != 0.0 {
+        t = half(1.0 - t)
+    }
+    return t
+}
+
+// fold_value: clamp saturates, repeat keeps the fraction, mirror folds every
+// other repeat back; unclamped edges and conics keep the value.
+function foldValue(t: Float, kind: Float) -> Float {
+    if kind == 0.0 || kind == 3.0 || kind == 9.0 || kind == 13.0 {
+        return clamp(t, 0.0, 1.0)
+    }
+    if kind == 1.0 || kind == 4.0 || kind == 10.0 || kind == 14.0 {
+        return fract(t)
+    }
+    if kind == 2.0 || kind == 5.0 || kind == 11.0 || kind == 15.0 {
+        let folded = fract(t * 0.5) * 2.0
+        if folded > 1.0 {
+            return 2.0 - folded
+        }
+        return folded
+    }
+    return t
+}
+
+// The power basis cubic RenderBox stores for a smooth segment, at `f`.
+const halfSmallest: Float = 0.00006103515625
+const halfTiny: Float = 0.000000059604644775390625
+
+// 2^n for a whole n, exactly: products of exact powers, where the GPU's
+// exp2 may miss by an ulp.
+function power2(n: Float) -> Float {
+    let k = abs(n)
+    let square = 2.0
+    if n < 0.0 {
+        square = 0.5
+    }
+    let result = 1.0
+    let step = 1.0
+    while step < 64.0 {
+        if fract(floor(k / step) * 0.5) != 0.0 {
+            result = result * square
+        }
+        square = square * square
+        step = step * 2.0
+    }
+    return result
+}
+
+// A half's bits for the half nearest `value`, which is not negative.
+function halfBits(value: Float) -> Float {
+    if value < halfSmallest {
+        return round(value / halfTiny)
+    }
+    let exponent = floor(log2(value))
+    if power2(exponent) > value {
+        exponent = exponent - 1.0
+    }
+    if power2(exponent + 1.0) <= value {
+        exponent = exponent + 1.0
+    }
+    let mantissa = round((value / power2(exponent) - 1.0) * 1024.0)
+    return (exponent + 15.0) * 1024.0 + mantissa
+}
+
+function halfValue(bits: Float) -> Float {
+    let exponent = floor(bits / 1024.0)
+    let mantissa = bits - exponent * 1024.0
+    if exponent == 0.0 {
+        return mantissa * halfTiny
+    }
+    return (1.0 + mantissa / 1024.0) * power2(exponent - 15.0)
+}
+
+// The half nearest `value`: RenderBox runs the mesh's colour in halves, each
+// step rounded.
+function half(value: Float) -> Float {
+    return sign(value) * halfValue(halfBits(abs(value)))
+}
+
+function unpremultiplied(color: Float4) -> Float4 {
+    if color.w > 0.0010004 {
+        return half4(Float4(color.xyz / color.w, color.w))
+    }
+    return Float4(0.0, 0.0, 0.0, 0.0)
+}
+
+// The entry of a table for |value|: its bits as a half over eight.
+function halfEntry(value: Float) -> Float {
+    let magnitude = abs(value)
+    if magnitude >= 65520.0 {
+        return 3968.0
+    }
+    if magnitude < 0.00006103515625 {
+        return floor(round(magnitude * 16777216.0) / 8.0)
+    }
+    let exponent = floor(log2(magnitude))
+    if power2(exponent) > magnitude {
+        exponent = exponent - 1.0
+    }
+    if power2(exponent + 1.0) <= magnitude {
+        exponent = exponent + 1.0
+    }
+    let mantissa = round((magnitude / power2(exponent) - 1.0) * 1024.0)
+    return floor(((exponent + 15.0) * 1024.0 + mantissa) / 8.0)
+}
+
+function half4(value: Float4) -> Float4 {
+    return Float4(half(value.x), half(value.y), half(value.z), half(value.w))
+}
+
+// a * b + c rounded once to a half, as RenderBox's fused steps.
+function halfFma(a: Float, b: Float4, c: Float4) -> Float4 {
+    return half4(b * a + c)
+}
+
+// OKLab's cube-rooted LMS back to linear: each cubed, then the halves of
+// the inverse matrix RenderBox keeps, m's column first, every step in halves.
+function fromOklab(color: Float4) -> Float4 {
+    let lms = Float4(
+        half(color.x * half(color.x * color.x)),
+        half(color.y * half(color.y * color.y)),
+        half(color.z * half(color.z * color.z)),
+        0.0,
+    )
+    let m = half4(Float4(-3.30859375, 2.609375, -0.70361328125, 0.0) * lms.y)
+    let l = halfFma(lms.x, Float4(4.078125, -1.2685546875, -0.0041961669921875, 0.0), m)
+    let rgb = halfFma(lms.z, Float4(0.23095703125, -0.34130859375, 1.7080078125, 0.0), l)
+    return Float4(rgb.xyz, color.w)
+}
+
+function cubicColor(c0: Float4, c1: Float4, c2: Float4, c3: Float4, f: Float) -> Float4 {
+    return halfFma(f, halfFma(f, halfFma(f, c3, c2), c1), c0)
+}
+
+// powr as the GPU runs it, exp2 of the exponent times log2, rounded to a
+// half; nothing of zero.
+function halfPow(x: Float, e: Float) -> Float {
+    if x <= 0.0 {
+        return 0.0
+    }
+    return half(exp2(e * log2(x)))
+}
+
+// mix in halves: a + t * (b - a) as two fused steps, as the mesh's.
+function halfMix(a: Float4, b: Float4, t: Float) -> Float4 {
+    return halfFma(t, b, halfFma(t, -a, a))
+}
+
+shader Gradient {
+    group Fill {
+        uniform globals: GradientGlobals
+        storage read stops: [Float]
+        texture noise: Texture2d
+        sampler noiseSampler: Sampler
+        texture layer: Texture2d
+        sampler layerSampler: Sampler
+        storage read transfer: [Float]
+    }
+
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        // Two triangles over the whole target, corners 0 1 2 and 0 2 3.
+        function entry(input: VertexIn) -> VertexOut {
+            let corner = input.vid
+            if input.vid == UInt(3) {
+                corner = UInt(0)
+            }
+            if input.vid > UInt(3) {
+                corner = input.vid - UInt(2)
+            }
+            let x = -1.0
+            if corner == UInt(1) || corner == UInt(2) {
+                x = 1.0
+            }
+            let y = 1.0
+            if corner > UInt(1) {
+                y = -1.0
+            }
+            let out: VertexOut
+            out.clip_position = Float4(x, y, 0.0, 1.0)
+            return out
+        }
+    }
+
+    fragment {
+        input VertexOut
+        output FragmentOut
+
+        function stopColor(at: UInt) -> Float4 {
+            return Float4(stops[at], stops[at + UInt(1)], stops[at + UInt(2)], stops[at + UInt(3)])
+        }
+
+        // The cubic of the segment whose coefficients start at `at`.
+        function cubicAt(at: UInt, f: Float) -> Float4 {
+            return cubicColor(
+                stopColor(at),
+                stopColor(at + UInt(4)),
+                stopColor(at + UInt(8)),
+                stopColor(at + UInt(12)),
+                f,
+            )
+        }
+
+        // sample_stops_uniform: stops evenly spaced, `t` already scaled by
+        // the last stop's index.
+        function uniformStops(t: Float) -> Float4 {
+            let index = UInt(t)
+            let f = fract(t)
+            if globals.smooth == 1.0 {
+                return cubicAt(index * UInt(16), f)
+            }
+            let stride = UInt(4)
+            if globals.curve == 1.0 {
+                stride = UInt(5)
+            }
+            let first = index * stride
+            let position = f
+            if globals.curve == 1.0 {
+                position = halfPow(f, stops[first + UInt(4)])
+            }
+            return halfMix(stopColor(first), stopColor(first + stride), position)
+        }
+
+        // The segment position t * scale + offset of the record at `at`,
+        // fused in halves.
+        function along(t: Float, at: UInt) -> Float {
+            return half(t * stops[at] + stops[at + UInt(1)])
+        }
+
+        // sample_stops_binary: the last stop at or before `t`, by halving
+        // the records after it, then that segment's colour.
+        function searchedStops(t: Float) -> Float4 {
+            let stride = UInt(8)
+            if globals.smooth == 1.0 {
+                stride = UInt(18)
+            }
+            let base = UInt(0)
+            let count = UInt(globals.count)
+            while count > UInt(1) {
+                let halved = count / UInt(2)
+                let record = (base + halved) * stride
+                if along(t, record) > 0.0 {
+                    base = base + halved
+                    count = count - halved
+                } else {
+                    count = halved
+                }
+            }
+            let at = base * stride
+            let f = clamp(along(t, at), 0.0, 1.0)
+            if globals.smooth == 1.0 {
+                return cubicAt(at + UInt(2), f)
+            }
+            let position = f
+            if globals.curve == 1.0 {
+                position = halfPow(f, stops[at + UInt(2)])
+            }
+            return halfMix(stopColor(at + UInt(4)), stopColor(at + stride + UInt(4)), position)
+        }
+
+        function transferred(color: Float4) -> Float4 {
+            let base = globals.table * 4096.0
+            let r = sign(color.x) * transfer[UInt(base + halfEntry(color.x))]
+            let g = sign(color.y) * transfer[UInt(base + halfEntry(color.y))]
+            let b = sign(color.z) * transfer[UInt(base + halfEntry(color.z))]
+            return Float4(r, g, b, color.w)
+        }
+
+        // Gradient::color_out: unpremultiplied unless every colour is
+        // opaque, out of OKLab, through the table, premultiplied again, in
+        // halves as RenderBox runs it.
+        function colorOut(color: Float4) -> Float4 {
+            let bits = UInt(globals.colorOut)
+            if (bits & UInt(5)) == UInt(0) {
+                return color
+            }
+            let opaque = (bits & UInt(2)) != UInt(0)
+            let result = half4(color)
+            if !opaque {
+                result = unpremultiplied(result)
+            }
+            if (bits & UInt(4)) != UInt(0) {
+                result = fromOklab(result)
+            }
+            if (bits & UInt(1)) != UInt(0) {
+                result = transferred(result)
+            }
+            if !opaque {
+                result = half4(Float4(result.xyz * result.w, result.w))
+            }
+            return result
+        }
+
+        // Gradient::value for every geometry but the alpha gradient.
+        function gradientValue(p: Float2) -> Float {
+            let kind = globals.kind
+            if kind == 6.0 {
+                return conicValue(p, globals.geometry.x, globals.geometry.y)
+            }
+            if kind == 3.0 || kind == 4.0 || kind == 5.0 || kind == 8.0 {
+                return length(p) * globals.geometry.x + globals.geometry.y
+            }
+            if kind >= 9.0 && kind <= 12.0 {
+                return twoPointValue(p, globals.geometry.x, globals.geometry.y, globals.swapped)
+            }
+            return p.x
+        }
+
+        // Gradient::color.
+        function colorAt(value: Float) -> Float4 {
+            let t = foldValue(value, globals.kind)
+            if globals.colorMode == 0.0 {
+                let position = t
+                if globals.curve == 1.0 {
+                    position = halfPow(clamp(t, 0.0, 1.0), globals.scale)
+                }
+                return halfMix(globals.color0, globals.color1, position)
+            }
+            if globals.colorMode == 3.0 {
+                return uniformStops(half(clamp(t, 0.0, 1.0) * globals.scale))
+            }
+            return searchedStops(t)
+        }
+
+        // alpha_effect_color's channel of the layer's pixel, mapped to a
+        // position.
+        function layerValue(device: Float2) -> Float {
+            let texel = sample(layer, layerSampler, (floor(device) + 0.5) * globals.targetScale)
+            let channel = dot(texel.xyz, Float3(0.21252, 0.71533, 0.072083))
+            if globals.component == 0.0 {
+                channel = texel.x
+            }
+            if globals.component == 1.0 {
+                channel = texel.y
+            }
+            if globals.component == 2.0 {
+                channel = texel.z
+            }
+            if globals.component == 3.0 {
+                channel = texel.w
+            }
+            return channel * globals.valueMap.x + globals.valueMap.y
+        }
+
+        function entry(input: VertexOut) -> FragmentOut {
+            let device = input.clip_position.xy
+            let p = globals.matrix.xy * device.x + globals.matrix.zw * device.y + globals.translation
+            // Gradient::value hands its colour a half.
+            let value = half(gradientValue(p))
+            if globals.fromLayer == 1.0 {
+                value = half(layerValue(device))
+            }
+            let color = colorOut(colorAt(value))
+            let texel = sample(noise, noiseSampler, device * 0.03125)
+            let dither = halfFma(0.0078430176, half4(texel), Float4(-0.0039215088))
+            let result: FragmentOut
+            result.color = Half4(Float4(halfFma(color.w, dither, color).xyz, color.w))
+            return result
+        }
+    }
+}

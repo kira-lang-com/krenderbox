@@ -1,0 +1,105 @@
+// RenderBox's alpha_effect_fragment in its threshold forms, 0 and 1: the
+// layer's channel mapped so the range's low end is 0 and its high end 1,
+// then the colour at the coverage of that band, antialiased across a pixel's
+// change. Form 1, a range with no high end, has only the low edge.
+//
+// The layer is read at the pixel, clamped to the target, with the linear
+// sampler, as the effect reads its texture.
+
+type ThresholdGlobals {
+    let color: Float4
+    // value = channel * map.x + map.y.
+    let map: Float2
+    // The channel: 0 to 3, or 4 for luminance.
+    let component: Float
+    let bounded: Float
+    let low: Float2
+    let high: Float2
+    // One over the target's size.
+    let targetScale: Float2
+}
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+}
+
+type FragmentOut {
+    let color: Half4
+}
+
+function channel(texel: Float4, component: Float) -> Float {
+    if component == 0.0 {
+        return texel.x
+    }
+    if component == 1.0 {
+        return texel.y
+    }
+    if component == 2.0 {
+        return texel.z
+    }
+    if component == 3.0 {
+        return texel.w
+    }
+    return dot(texel.xyz, Float3(0.2124, 0.7153, 0.0722))
+}
+
+shader AlphaThreshold {
+    group Filter {
+        uniform globals: ThresholdGlobals
+        texture source: Texture2d
+        sampler sourceSampler: Sampler
+    }
+
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        function entry(input: VertexIn) -> VertexOut {
+            let corner = input.vid
+            if input.vid == UInt(3) {
+                corner = UInt(0)
+            }
+            if input.vid > UInt(3) {
+                corner = input.vid - UInt(2)
+            }
+            let x = -1.0
+            if corner == UInt(1) || corner == UInt(2) {
+                x = 1.0
+            }
+            let y = 1.0
+            if corner > UInt(1) {
+                y = -1.0
+            }
+            let out: VertexOut
+            out.clip_position = Float4(x, y, 0.0, 1.0)
+            return out
+        }
+    }
+
+    fragment {
+        input VertexOut
+        output FragmentOut
+
+        function entry(input: VertexOut) -> FragmentOut {
+            let point = clamp(input.clip_position.xy, globals.low, globals.high)
+            let texel = sample(source, sourceSampler, point * globals.targetScale)
+            let value = channel(texel, globals.component) * globals.map.x + globals.map.y
+            // 0xH1419: the narrowest edge the coverage takes.
+            let width = max(fwidth(value), 0.0012207)
+            let covered = clamp(value / width + 0.5, 0.0, 1.0)
+            if globals.bounded == 1.0 {
+                let above = clamp((value - 1.0) / width + 0.5, 0.0, 1.0)
+                covered = covered - above * covered
+            }
+            let result: FragmentOut
+            result.color = Half4(globals.color * covered)
+            return result
+        }
+    }
+}

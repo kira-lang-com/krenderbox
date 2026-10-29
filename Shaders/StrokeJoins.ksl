@@ -1,0 +1,296 @@
+// RenderBox's stroke_joins_vertex and stroke_joins_fragment (joins_shape):
+// every point between two segments that joins by a miter or a bevel, or that
+// a butt cap is cut back from, draws a quad over its join into the coverage
+// accumulator, which keeps the largest coverage the join or any segment
+// gives a pixel.
+//
+// Join i is at point i + 1, between the segments from point i and to point
+// i + 2. RenderBox draws each join as an instance of a four-vertex indexed
+// strip; here each is six vertices of a list over the quad's corners 0 1 2
+// and 0 2 3.
+//
+// The quad carries up to three lines, each a point and a direction; the
+// coverage is the farthest the pixel is past any of them, on their left.
+
+type StrokeGlobals {
+    // Stroke space to clip space: x * matrix.xy + y * matrix.zw + translation.
+    let matrix: Float4
+    let translation: Float2
+    let depth: Float
+    // How far one device pixel reaches in stroke space.
+    let aa: Float
+    // RB::LineCap: 0 round, 1 square, 2 butt, then the triangles.
+    let cap: Float
+    // RB::LineJoin: 0 miter, 1 round, 2 bevel.
+    let join: Float
+    // 1 when the stroke is aliased.
+    let aliased: Float
+    // 1 when points carry an alpha other than one.
+    let varyingAlpha: Float
+}
+
+type StrokeLinePoint {
+    let geometry: Float4
+    let marks: Float4
+}
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+    let line0: Float4
+    let line1: Float4
+    let line2: Float4
+    let local: Float2
+    let alpha: Float
+    let join: Float
+}
+
+type FragmentOut {
+    let color: Half4
+}
+
+const joinVertices: UInt = 6
+const buttEnd: Float = -2.0
+const padMark: Float = -3.0
+const miterJoin: Float = 0.0
+const bevelJoin: Float = 2.0
+const buttCap: Float = 2.0
+// A miter whose sides are nearer parallel than this draws nothing.
+const parallel: Float = 0.05
+
+function perpendicular(vector: Float2) -> Float2 {
+    return Float2(-vector.y, vector.x)
+}
+
+function flipped(value: Float, keep: Bool) -> Float {
+    if keep {
+        return value
+    }
+    return -value
+}
+
+// The line through `point` going `direction`, its direction flipped
+// unless `keep`.
+function lineThrough(point: Float2, direction: Float2, keep: Bool) -> Float4 {
+    let along = normalize(direction)
+    if !keep {
+        along = -along
+    }
+    return Float4(point.x, point.y, along.x, along.y)
+}
+
+shader StrokeJoins {
+    group Stroke {
+        uniform globals: StrokeGlobals
+        storage read points: [StrokeLinePoint]
+    }
+
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        function toClip(position: Float2) -> Float4 {
+            let xy = globals.matrix.xy * position.x + globals.matrix.zw * position.y + globals.translation
+            return Float4(xy.x, xy.y, globals.depth, 1.0)
+        }
+
+        // The quad corner a list vertex stands for.
+        function stripCorner(vid: UInt) -> UInt {
+            let corner = vid % joinVertices
+            if corner == UInt(3) {
+                return UInt(0)
+            }
+            if corner > UInt(3) {
+                return corner - UInt(2)
+            }
+            return corner
+        }
+
+        // A butt cap's cut: the quad from the cut point back over the end it
+        // was cut from, bounded by the cap's edge and the stroke's sides.
+        function buttQuad(out: VertexOut, p0: StrokeLinePoint, p1: StrokeLinePoint, p2: StrokeLinePoint, u: Float2, v: Float2, corner: UInt) -> VertexOut {
+            let aa = globals.aa
+            let atStart = p0.marks.x == padMark
+            let a = -v
+            let b = -u
+            let radius = p0.geometry.z
+            let toward = p0.geometry.xy
+            if atStart {
+                a = u
+                b = v
+                radius = p2.geometry.z
+                toward = p2.geometry.xy
+            }
+            let reach = length(p1.geometry.xy - toward) * 2.0
+            let sameWay = dot(a, b) > 0.0
+            let sign = 1.0
+            if !sameWay {
+                sign = -1.0
+            }
+            let keep = flipped(sign, dot(perpendicular(a), b) > 0.0) > 0.0
+            let side = perpendicular(b) * flipped(radius, keep)
+            let back = -reach * b - side
+            let forth = -reach * b + side
+            let result = out
+            result.line0 = lineThrough(side, back - side, keep)
+            result.line1 = lineThrough(back, -side - back, keep)
+            result.line2 = lineThrough(side, forth - side, keep)
+            let across = -(radius + aa)
+            if corner == UInt(1) || corner == UInt(2) {
+                across = radius + aa
+            }
+            let along = -aa
+            if corner > UInt(1) {
+                along = reach + aa
+            }
+            let offset = perpendicular(b) * flipped(across, keep) - b * along
+            result.local = offset
+            result.clip_position = toClip(toward + offset)
+            return result
+        }
+
+        // A bevel: the quad over the triangle between the two sides' ends.
+        function bevelQuad(out: VertexOut, p1: StrokeLinePoint, u: Float2, v: Float2, keep: Bool, corner: UInt) -> VertexOut {
+            let aa = globals.aa
+            let radius = flipped(p1.geometry.z, keep)
+            let first = perpendicular(u) * radius
+            let second = perpendicular(v) * radius
+            let result = out
+            result.line2 = lineThrough(first, first - second, keep)
+            let outer = p1.geometry.z + aa * 0.5
+            let acrossFirst = -aa
+            if corner == UInt(1) || corner == UInt(2) {
+                acrossFirst = outer
+            }
+            let acrossSecond = -aa
+            if corner > UInt(1) {
+                acrossSecond = outer
+            }
+            let offset = perpendicular(u) * flipped(acrossFirst, keep) + perpendicular(v) * flipped(acrossSecond, keep)
+            result.local = offset
+            result.clip_position = toClip(p1.geometry.xy + offset)
+            return result
+        }
+
+        // A miter: the quad from inside the corner out to its tip.
+        function miterQuad(out: VertexOut, p1: StrokeLinePoint, u: Float2, v: Float2, keep: Bool, corner: UInt) -> VertexOut {
+            let aa = globals.aa
+            let radius = flipped(p1.geometry.z, keep)
+            let first = perpendicular(u) * radius
+            let second = perpendicular(v) * radius
+            let firstAlong = u
+            let secondAlong = v
+            if keep {
+                firstAlong = -u
+                secondAlong = -v
+            }
+            let result = out
+            result.line2 = Float4(0.0, 0.0, 0.0, 0.0)
+            let turn = dot(perpendicular(secondAlong), firstAlong)
+            if abs(turn) < parallel {
+                result.local = Float2(0.0, 0.0)
+                result.clip_position = Float4(-1.0, -1.0, globals.depth, 1.0)
+                return result
+            }
+            let outer = flipped(p1.geometry.z + aa * 0.5, keep)
+            let bisector = perpendicular(normalize(u + v))
+            let offset = perpendicular(v) * outer
+            if corner == UInt(0) {
+                offset = bisector * flipped(-aa, keep)
+            }
+            if corner == UInt(1) {
+                offset = perpendicular(u) * outer
+            }
+            if corner == UInt(2) {
+                let tip = dot(perpendicular(first - second), secondAlong) / turn
+                offset = firstAlong * tip + first + bisector * flipped(aa, keep)
+            }
+            result.local = offset
+            result.clip_position = toClip(p1.geometry.xy + offset)
+            return result
+        }
+
+        function entry(input: VertexIn) -> VertexOut {
+            let index = input.vid / joinVertices
+            let corner = stripCorner(input.vid)
+            let p0 = points[index]
+            let p1 = points[index + UInt(1)]
+            let p2 = points[index + UInt(2)]
+            let join = p1.marks.x
+            let out: VertexOut
+            out.line0 = Float4(0.0, 0.0, 0.0, 0.0)
+            out.line1 = Float4(0.0, 0.0, 0.0, 0.0)
+            out.line2 = Float4(0.0, 0.0, 0.0, 0.0)
+            out.local = Float2(0.0, 0.0)
+            out.join = join
+            let alpha = 1.0
+            if globals.aliased == 0.0 {
+                alpha = p1.geometry.z / max(p1.geometry.z, globals.aa * 0.5)
+            }
+            if globals.varyingAlpha == 1.0 {
+                alpha = alpha * p1.geometry.w
+            }
+            out.alpha = alpha
+            out.clip_position = Float4(-1.0, -1.0, globals.depth, 1.0)
+            if join != buttEnd && join != miterJoin && join != bevelJoin {
+                return out
+            }
+            let u = normalize(p1.geometry.xy - p0.geometry.xy)
+            let v = normalize(p2.geometry.xy - p1.geometry.xy)
+            if globals.cap == buttCap && join == buttEnd {
+                return buttQuad(out, p0, p1, p2, u, v, corner)
+            }
+            let keep = dot(perpendicular(v), u) > 0.0
+            let radius = flipped(p1.geometry.z, keep)
+            let firstAlong = u
+            let secondAlong = v
+            if keep {
+                firstAlong = -u
+                secondAlong = -v
+            }
+            let first = perpendicular(u) * radius
+            let second = perpendicular(v) * radius
+            out.line0 = Float4(first.x, first.y, firstAlong.x, firstAlong.y)
+            out.line1 = Float4(second.x, second.y, secondAlong.x, secondAlong.y)
+            if globals.join != miterJoin || join == bevelJoin {
+                return bevelQuad(out, p1, u, v, keep, corner)
+            }
+            return miterQuad(out, p1, u, v, keep, corner)
+        }
+    }
+
+    fragment {
+        input VertexOut
+        output FragmentOut
+
+        // How far the pixel is past `line`, on its left.
+        function past(line: Float4, local: Float2) -> Float {
+            return dot(Float2(-line.w, line.z), line.xy - local)
+        }
+
+        function entry(input: VertexOut) -> FragmentOut {
+            let distance = max(past(input.line0, input.local), past(input.line1, input.local))
+            if input.join == buttEnd || input.join == bevelJoin {
+                distance = max(distance, past(input.line2, input.local))
+            }
+            let half = globals.aa * 0.5
+            let coverage = 0.0
+            if globals.aliased == 1.0 {
+                if distance < half {
+                    coverage = 1.0
+                }
+            } else {
+                let s = clamp((half - distance) / (half * 2.0), 0.0, 1.0)
+                coverage = s * s * (3.0 - 2.0 * s)
+            }
+            let result: FragmentOut
+            result.color = Half4(Float4(0.0, coverage * input.alpha, 0.0, 0.0))
+            return result
+        }
+    }
+}

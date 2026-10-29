@@ -1,0 +1,287 @@
+// RenderBox's stroke_lines_vertex and stroke_lines_fragment (lines_shape):
+// every segment of a flattened stroke draws a quad over its capsule into the
+// coverage accumulator, which keeps the largest coverage any segment gives a
+// pixel.
+//
+// Segment i runs from point i + 1 to point i + 2; points i and i + 3 are its
+// neighbours, and a neighbour flagged -3 is a pad marking a capped end. A
+// segment either end of which is flagged below zero draws nothing. RenderBox
+// draws each segment as an instance of a four-vertex indexed strip; here
+// each is six vertices of a list over the quad's corners 0 1 2 and 0 2 3.
+//
+// The point buffer is RB::Shader::StrokeLinePoint's fields in two float4s:
+// position, half width, alpha, then the flags.
+
+type StrokeGlobals {
+    // Stroke space to clip space: x * matrix.xy + y * matrix.zw + translation.
+    let matrix: Float4
+    let translation: Float2
+    let depth: Float
+    // How far one device pixel reaches in stroke space.
+    let aa: Float
+    // RB::LineCap: 0 round, 1 square, 2 butt, then the triangles.
+    let cap: Float
+    // RB::LineJoin: 0 miter, 1 round, 2 bevel.
+    let join: Float
+    // 1 when the stroke is aliased.
+    let aliased: Float
+    // 1 when points carry an alpha other than one.
+    let varyingAlpha: Float
+}
+
+type StrokeLinePoint {
+    let geometry: Float4
+    let marks: Float4
+}
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+    // Along the segment from its start, and across it.
+    let local: Float2
+    let widths: Float2
+    let segmentLength: Float
+    let alphas: Float2
+    // 1 where the segment's start or end is capped.
+    let caps: Float2
+}
+
+type FragmentOut {
+    let color: Half4
+}
+
+const segmentVertices: UInt = 6
+const padMark: Float = -3.0
+const buttCap: Float = 2.0
+const roundJoin: Float = 1.0
+// A narrower neighbour by this share of its length still extends the
+// segment round.
+const widthChange: Float = 0.1
+
+function perpendicular(vector: Float2) -> Float2 {
+    return Float2(-vector.y, vector.x)
+}
+
+shader StrokeLines {
+    group Stroke {
+        uniform globals: StrokeGlobals
+        storage read points: [StrokeLinePoint]
+    }
+
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        function toClip(position: Float2) -> Float4 {
+            let xy = globals.matrix.xy * position.x + globals.matrix.zw * position.y + globals.translation
+            return Float4(xy.x, xy.y, globals.depth, 1.0)
+        }
+
+        // The quad corner a list vertex stands for: corners 0 to 3 go around
+        // the quad, start, end, end, start.
+        function stripCorner(vid: UInt) -> UInt {
+            let corner = vid % segmentVertices
+            if corner == UInt(3) {
+                return UInt(0)
+            }
+            if corner > UInt(3) {
+                return corner - UInt(2)
+            }
+            return corner
+        }
+
+        function entry(input: VertexIn) -> VertexOut {
+            let index = input.vid / segmentVertices
+            let corner = stripCorner(input.vid)
+            let p0 = points[index]
+            let p1 = points[index + UInt(1)]
+            let p2 = points[index + UInt(2)]
+            let p3 = points[index + UInt(3)]
+            let aa = globals.aa
+            let atStart = corner == UInt(0) || corner == UInt(3)
+            let side = 1.0
+            if corner <= UInt(1) {
+                side = -1.0
+            }
+            let w1 = p1.geometry.z
+            let w2 = p2.geometry.z
+            let reach = max(w1, w2) + aa * 0.5
+            let span = p2.geometry.xy - p1.geometry.xy
+            let segmentLength = length(span)
+            let toward = span
+            if !(segmentLength > 0.0) {
+                toward = p1.geometry.xy - p0.geometry.xy
+            }
+            let direction = normalize(toward)
+            let capStart = p0.marks.x == padMark
+            let capEnd = p3.marks.x == padMark
+            let out: VertexOut
+            out.widths = Float2(w1, w2)
+            out.alphas = Float2(p1.geometry.w, p2.geometry.w)
+            let startMark = 0.0
+            if capStart {
+                startMark = 1.0
+            }
+            let endMark = 0.0
+            if capEnd {
+                endMark = 1.0
+            }
+            out.caps = Float2(startMark, endMark)
+            if min(p1.marks.x, p2.marks.x) < 0.0 {
+                out.clip_position = Float4(-1.0, -1.0, globals.depth, 1.0)
+                out.local = Float2(0.0, 0.0)
+                out.segmentLength = segmentLength
+                return out
+            }
+            let neighbour = p3.geometry.xy - p2.geometry.xy
+            let join = p2.marks.x
+            let isCap = capEnd
+            let widthDrop = w2 - p3.geometry.z
+            if atStart {
+                neighbour = p1.geometry.xy - p0.geometry.xy
+                join = p1.marks.x
+                isCap = capStart
+                widthDrop = w1 - p0.geometry.z
+            }
+            let neighbourLength = length(neighbour)
+            let away = neighbour
+            if neighbourLength > 0.0 {
+                away = neighbour / neighbourLength
+            }
+            // A butt cap starts and ends a pixel inside its points.
+            let origin = p1.geometry.xy
+            let reachLength = segmentLength
+            if globals.cap == buttCap && (capStart || capEnd) {
+                if capStart && segmentLength > aa {
+                    origin = origin + direction * aa
+                    reachLength = reachLength - aa
+                }
+                if capEnd && reachLength > aa {
+                    reachLength = reachLength - aa
+                }
+            }
+            let rounded = (globals.join == roundJoin && globals.cap != buttCap) || join == roundJoin
+            let extend = true
+            if !isCap && dot(-away, direction) < 0.0 {
+                extend = !(max(0.0, widthDrop) / neighbourLength < widthChange)
+            }
+            let axis = perpendicular(direction)
+            let offset = Float2(0.0, 0.0)
+            if !rounded || extend {
+                let along = 0.0
+                if !atStart {
+                    along = reachLength
+                }
+                if rounded || isCap {
+                    along = reach + reachLength
+                    if atStart {
+                        along = -reach
+                    }
+                }
+                offset = direction * along + axis * (reach * side)
+            } else {
+                // The quad ends on the bisector of the two directions.
+                let bisector = normalize(direction + away)
+                let across = perpendicular(bisector)
+                let cut = reach / dot(axis, across)
+                let along = aa * 0.5 + reachLength
+                if atStart {
+                    along = aa * -0.5
+                }
+                offset = direction * along + across * (cut * side)
+            }
+            out.clip_position = toClip(origin + offset)
+            out.local = Float2(dot(offset, direction), dot(offset, axis))
+            out.segmentLength = reachLength
+            return out
+        }
+    }
+
+    fragment {
+        input VertexOut
+        output FragmentOut
+
+        // How far past the segment's end the pixel is, measured by the cap.
+        function capDistance(cap: Float, along: Float, beyond: Float, across: Float, width: Float) -> Float {
+            if cap == 1.0 {
+                return max(beyond, across)
+            }
+            if cap == 2.0 {
+                return max(width + beyond - globals.aa, across)
+            }
+            if cap == 3.0 {
+                return across + beyond
+            }
+            if cap == 4.0 {
+                return max(width + beyond - across, across)
+            }
+            if cap == 5.0 {
+                let from = width - across
+                if along > 0.0 {
+                    from = across
+                }
+                return max(from + beyond, across)
+            }
+            if cap == 6.0 {
+                let from = across
+                if along > 0.0 {
+                    from = width - across
+                }
+                return max(from + beyond, across)
+            }
+            if cap == 7.0 {
+                return across
+            }
+            return length(Float2(beyond, across))
+        }
+
+        function entry(input: VertexOut) -> FragmentOut {
+            let aa = globals.aa
+            let along = input.local.x
+            let ratio = along / input.segmentLength
+            let across = abs(input.local.y)
+            let t = clamp(ratio, 0.0, 1.0)
+            let width = mix(input.widths.x, input.widths.y, t)
+            let alpha = 1.0
+            let halfWidth = width
+            if globals.aliased == 0.0 {
+                halfWidth = max(width, aa * 0.5)
+                alpha = width / halfWidth
+            }
+            if globals.varyingAlpha == 1.0 {
+                alpha = alpha * mix(input.alphas.x, input.alphas.y, t)
+            }
+            let distance = across
+            if t != ratio {
+                let beyond = abs(min(along, input.segmentLength - along))
+                let capped = input.caps.x
+                if ratio > 0.5 {
+                    capped = input.caps.y
+                }
+                distance = length(Float2(beyond, across))
+                if globals.cap != 0.0 && capped == 1.0 {
+                    distance = capDistance(globals.cap, along, beyond, across, halfWidth)
+                }
+            }
+            let outside = distance - halfWidth
+            let half = aa * 0.5
+            let coverage = 0.0
+            if globals.aliased == 1.0 {
+                if outside < half {
+                    coverage = alpha
+                }
+            } else {
+                let s = clamp((half - outside) / (half * 2.0), 0.0, 1.0)
+                coverage = alpha * s * s * (3.0 - 2.0 * s)
+            }
+            let result: FragmentOut
+            result.color = Half4(Float4(0.0, coverage, 0.0, 0.0))
+            return result
+        }
+    }
+}

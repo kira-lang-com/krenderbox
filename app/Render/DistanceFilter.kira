@@ -1,0 +1,343 @@
+import Foundation
+import Ember
+
+namespace DistanceDrawing {
+    let pipeline: String = "renderbox-distance"
+    let surfacePipeline: String = "renderbox-distance-surface"
+    let globalsFloatCount: UN32 = 16
+    let globalsBinding: UN32 = 0
+    let sourceBinding: UN32 = 1
+    let destinationBinding: UN32 = 2
+    let tableBinding: UN32 = 3
+    let tableSamplerBinding: UN32 = 4
+    let vertexCount: UN32 = 6
+    // Distance::render: the flood's first jump is half of 2^n, n kept from 2
+    // to 12, and a jump this short or shorter is the last.
+    let lowestExponent: Number = 2
+    let highestExponent: Number = 12
+    let lastJump: Number = 0.75
+    // The variance the smoothing takes when neither a radius nor a level
+    // says, the most it takes, and each level's.
+    let defaultVariance: Number = 12.25
+    let largestVariance: Number = 392
+    let levelVariances: [Number] = [0, 12.25, 24.5, 36.75]
+}
+
+// filter_distance's modes, state word 0 bits 16 to 19.
+namespace DistanceModes {
+    let threshold: Number = 0
+    let alpha: Number = 1
+    let seed: Number = 2
+    let flood: Number = 3
+    let lastFlood: Number = 4
+    let measure: Number = 5
+    let measureDestination: Number = 6
+    let grade: Number = 9
+    let alphaGrade: Number = 10
+}
+
+// One filter_distance draw: its mode, jump and map, and whether it writes the
+// half-float field or the 8-bit result.
+struct DistancePass {
+    let mode: Number
+    var step: Number = 1
+    var scale: Number = 1
+    var offset: Number = 0
+    var halfFloat: Bool = true
+}
+
+// FilterStyle<Distance>::draw then Distance::render: the jump flood from
+// `source`'s edge, its distance smoothed, written as the format says, and the
+// alpha it is composited at.
+function distanceFiltered(
+    session: borrow mut RenderSession,
+    source: GraphicsTexture,
+    style: borrow DistanceStyle,
+    opacity: Number
+) -> Result<(GraphicsTexture, Number), RenderFailure> {
+    let noDistance = style.inside == 0 && style.outside == 0
+    let aliased = style.edges == .AlphaIsDistance || noDistance
+    // The alpha drawn alone as a distance draws with an RB shader not
+    // ported.
+    if aliased && style.format == .Distance {
+        return .Error(.UnportedStyle)
+    }
+    let table = try distanceTable(session)
+    if style.edges == .AlphaIsDistance {
+        return .Ok((try alphaDistance(session, style, source, table), opacity))
+    }
+    var layer = copy source
+    if style.edges != .Exact {
+        let threshold = DistancePass { mode: DistanceModes.threshold, halfFloat: false }
+        layer = try distancePass(session, threshold, source, source, table)
+    }
+    let field = try floodedField(session, style, layer, table)
+    let measure = measurePass(style)
+    let (read, against) = measureReads(style.format, field, layer)
+    let measured = try distancePass(session, measure, read, against, table)
+    returnSurface(session, field)
+    returnStep(session, layer, source)
+    if style.format == .Distance { return .Ok((measured, opacity)) }
+    // A blur of no rounds hands `measured` back as it is, so neither goes
+    // back to the session before the grade has read it.
+    let smoothed = try narrowBlurred(session, measured, smoothingVariance(style))
+    let graded = try gradedDistance(session, style.format, smoothed, table)
+    returnSurface(session, measured)
+    returnSurface(session, smoothed)
+    return .Ok((graded, opacity))
+}
+
+// The pass measuring the flooded field against the edge: the distance
+// itself, or for a graded format the distance before it is smoothed, which
+// reads the two the other way round.
+function measurePass(style: borrow DistanceStyle) -> DistancePass {
+    let (scale, offset) = distanceMap(style)
+    return match style.format {
+        Distance -> DistancePass {
+            mode: DistanceModes.measure,
+            scale: scale,
+            offset: offset,
+            halfFloat: false
+        }
+        Gradient -> gradedMeasure(scale, offset)
+        GradientInverse -> gradedMeasure(scale, offset)
+        GradientFloat -> gradedMeasure(scale, offset)
+        GradientFloatInverse -> gradedMeasure(scale, offset)
+    }
+}
+
+function gradedMeasure(scale: Number, offset: Number) -> DistancePass {
+    return DistancePass { mode: DistanceModes.measureDestination, scale: scale, offset: offset }
+}
+
+// The source and destination the measure reads: the field then the edge
+// for the distance, the edge then the field for a gradient.
+function measureReads(
+    format: DistanceFormat,
+    field: borrow GraphicsTexture,
+    layer: borrow GraphicsTexture
+) -> (GraphicsTexture, GraphicsTexture) {
+    return match format {
+        Distance -> (copy field, copy layer)
+        Gradient -> (copy layer, copy field)
+        GradientInverse -> (copy layer, copy field)
+        GradientFloat -> (copy layer, copy field)
+        GradientFloatInverse -> (copy layer, copy field)
+    }
+}
+
+// Alpha taken as the distance: the alpha in every channel, smoothed from
+// DistanceRenderer's first blur, then mode 10's value of the alpha and the
+// slope of its smoothing.
+function alphaDistance(
+    session: borrow mut RenderSession,
+    style: borrow DistanceStyle,
+    source: borrow GraphicsTexture,
+    table: borrow GraphicsTexture
+) -> Result<GraphicsTexture, RenderFailure> {
+    let spread = DistancePass { mode: DistanceModes.alpha, halfFloat: false }
+    let alpha = try distancePass(session, spread, source, source, table)
+    let smoothed = try narrowBlurred(session, alpha, smoothingVariance(style))
+    let (scale, offset) = formatMap(style.format)
+    let grade = DistancePass {
+        mode: DistanceModes.alphaGrade,
+        scale: scale,
+        offset: offset,
+        halfFloat: false
+    }
+    let graded = try distancePass(session, grade, smoothed, alpha, table)
+    returnSurface(session, smoothed)
+    returnSurface(session, alpha)
+    return .Ok(graded)
+}
+
+// The jump flood: every pixel's vector to the nearest point of the edge,
+// from the seeds the edge's pixels give, in jumps halving to one.
+function floodedField(
+    session: borrow mut RenderSession,
+    style: borrow DistanceStyle,
+    layer: borrow GraphicsTexture,
+    table: borrow GraphicsTexture
+) -> Result<GraphicsTexture, RenderFailure> {
+    var jump = floodSpan(max(abs(style.inside), abs(style.outside))) * 0.5
+    var field = try distancePass(
+        session,
+        DistancePass { mode: DistanceModes.seed },
+        layer,
+        layer,
+        table
+    )
+    var finished = false
+    while !finished {
+        let next = jump * 0.5
+        finished = next <= DistanceDrawing.lastJump
+        let mode = finished ? DistanceModes.lastFlood : DistanceModes.flood
+        let flooded = try distancePass(
+            session,
+            DistancePass { mode: mode, step: jump },
+            field,
+            field,
+            table
+        )
+        returnSurface(session, field)
+        field = flooded
+        jump = next
+    }
+    return .Ok(field)
+}
+
+// The power of two frexpf gives `length`, less one for an exact power, kept
+// from 2^2 to 2^12.
+function floodSpan(length: Number) -> Number {
+    var exponent: Number = 0
+    var power: Number = 1
+    while power <= length {
+        power *= 2
+        exponent += 1
+    }
+    if length * 2 == power {
+        exponent -= 1
+    }
+    let kept = clamp(exponent, DistanceDrawing.lowestExponent, DistanceDrawing.highestExponent)
+    return pow(2, kept)
+}
+
+// A signed distance to its value: nothing `outside` pixels outside the
+// edge, one `inside` pixels outside it, a half for both at once.
+function distanceMap(style: borrow DistanceStyle) -> (Number, Number) {
+    if style.outside == style.inside {
+        return (1, 0.5)
+    }
+    let scale = 1 / (style.outside - style.inside)
+    return (scale, scale * style.outside)
+}
+
+// The gradient formats' map of a unit normal into a channel.
+function formatMap(format: DistanceFormat) -> (Number, Number) {
+    return match format {
+        Gradient -> (0.5, 0.5)
+        GradientInverse -> (-0.5, 0.5)
+        GradientFloat -> (1, 0)
+        GradientFloatInverse -> (-1, 0)
+        Distance -> (1, 0)
+    }
+}
+
+// Distance::render's variance: the radius squared, or the level's, kept to
+// 392.
+function smoothingVariance(style: borrow DistanceStyle) -> Number {
+    var variance = DistanceDrawing.defaultVariance
+    if style.smoothingRadius >= 0 {
+        variance = style.smoothingRadius * style.smoothingRadius
+    } else {
+        let level = Number(code(style.smoothing))
+        if level >= 1 && level <= 4 {
+            variance = DistanceDrawing.levelVariances[level - 1]
+        }
+    }
+    return min(variance, DistanceDrawing.largestVariance)
+}
+
+// Mode 9: the smoothed distance's value and the unit normal of its slope,
+// mapped by the format, into an 8-bit surface.
+function gradedDistance(
+    session: borrow mut RenderSession,
+    format: DistanceFormat,
+    smoothed: borrow GraphicsTexture,
+    table: borrow GraphicsTexture
+) -> Result<GraphicsTexture, RenderFailure> {
+    let (scale, offset) = formatMap(format)
+    let grade = DistancePass {
+        mode: DistanceModes.grade,
+        scale: scale,
+        offset: offset,
+        halfFloat: false
+    }
+    return distancePass(session, grade, smoothed, smoothed, table)
+}
+
+// Device::distance_texture, made for the session's filter.
+function distanceTable(
+    session: borrow mut RenderSession
+) -> Result<GraphicsTexture, RenderFailure> {
+    let made = session.device.graphics().createTextureFromPixels(
+        TextureDescriptor {
+            label: "renderbox-distance-table",
+            width: DistanceTable.side,
+            height: DistanceTable.side,
+            format: .Rgba16Float
+        },
+        distanceTableTexels()
+    )
+    let texture = match made {
+        Ok(texture) -> texture
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    session.textures.append(copy texture)
+    return .Ok(texture)
+}
+
+// One filter_distance draw over the whole target into a surface of its own,
+// reading `source` and `destination` pixel for pixel.
+function distancePass(
+    session: borrow mut RenderSession,
+    pass: borrow DistancePass,
+    source: borrow GraphicsTexture,
+    destination: borrow GraphicsTexture,
+    table: borrow GraphicsTexture
+) -> Result<GraphicsTexture, RenderFailure> {
+    let target = pass.halfFloat ? try floatSurface(
+        session,
+        "renderbox-distance-field"
+    ) : try surface(session, "renderbox-distance")
+    let pipeline = try distancePipeline(session, pass.halfFloat)
+    let uniform = try sessionUniform(
+        session,
+        "renderbox-distance-globals",
+        DistanceDrawing.globalsFloatCount,
+        distanceFloats(session, pass)
+    )
+    let graphics = session.device.graphics()
+    let bindGroup = match graphics.beginBindGroup("renderbox-distance") {
+        Ok(bindGroup) -> bindGroup
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    graphics.bindGroupAddUniform(bindGroup, DistanceDrawing.globalsBinding, uniform)
+    graphics.bindGroupAddTexture(bindGroup, DistanceDrawing.sourceBinding, source)
+    graphics.bindGroupAddTexture(bindGroup, DistanceDrawing.destinationBinding, destination)
+    graphics.bindGroupAddTexture(bindGroup, DistanceDrawing.tableBinding, table)
+    graphics.bindGroupAddSampler(bindGroup, DistanceDrawing.tableSamplerBinding, session.sampler)
+    session.bindGroups.append(copy bindGroup)
+    let draw = RecordedDraw {
+        pipeline: pipeline,
+        bindGroup: bindGroup,
+        vertexCount: DistanceDrawing.vertexCount
+    }
+    try drawPass(session, target, Surfaces.transparent, [draw])
+    return .Ok(target)
+}
+
+function distancePipeline(
+    session: borrow mut RenderSession,
+    halfFloat: Bool
+) -> Result<RenderPipeline, RenderFailure> {
+    let name = halfFloat ? DistanceDrawing.pipeline : DistanceDrawing.surfacePipeline
+    let format: TextureFormat = halfFloat ? .Rgba16Float : session.format
+    return namedPipeline(
+        session,
+        move name,
+        ksl!("Shaders/Distance.ksl"),
+        ColorTargetDescriptor { format: format, blend: BlendState { enabled: false } }
+    )
+}
+
+// DistanceGlobals: the source read where the target is, every neighbour
+// within the target, the map, the jump and the mode, and the textures' size.
+function distanceFloats(session: borrow RenderSession, pass: borrow DistancePass) -> [Number] {
+    let width = Number(session.width)
+    let height = Number(session.height)
+    return [
+        0, 0, 0, 0, width, height, pass.scale, pass.offset, pass.step, pass.mode, width, height,
+        width, height, 0, 0
+    ]
+}

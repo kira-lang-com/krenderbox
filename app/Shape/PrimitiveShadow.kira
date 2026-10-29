@@ -1,0 +1,157 @@
+import Foundation
+
+namespace PrimitiveShadows {
+    // make_shadow: a blurred corner is rounded out to 1.8 deviations, and a
+    // blurred edge spreads over 2.8. A shape narrower than that spread loses
+    // alpha by its share t of it, as t / (0.5857729 t + 0.41422713).
+    let cornerSpread: Number = 1.8
+    let edgeSpread: Number = 2.8
+    let narrowSlope: Number = 0.5857729
+    let narrowBase: Number = 0.41422713
+}
+
+// What make_shadow returns: the primitive blurred, and what the shadow's
+// alpha is multiplied by.
+public struct ShadowedPrimitive {
+    let primitive: Primitive
+    let alpha: Number
+}
+
+// RB::Coverage::Primitive::make_shadow: the primitive blurred by `radius`,
+// which `transform` takes into the primitive's space, its corners rounded
+// out to hold the blur. None where only a blurred layer can draw it: a
+// distance field, a stroked rect, a squeezed rounded rect or ellipse. The
+// RB_EXACT_BLUR debug default, which always takes the layer, is not read.
+public function shadowedPrimitive(
+    primitive: borrow Primitive,
+    transform: borrow AffineTransform,
+    radius: Number,
+    inverse: Bool
+) -> ShadowedPrimitive? {
+    if code(primitive.renderingMode) > 1 {
+        return .None
+    }
+    let deviation = transform.lengthScale() * max(radius, 0)
+    var shadow = copy primitive
+    let flat = primitive.kind == .Empty || primitive.kind == .Infinite
+    var alpha: Number = 1
+    if !flat {
+        let side = try shadowCorners(shadow, deviation) otherwise return .None
+        let blur = primitive.blurred
+        ? sqrt(
+            deviation * deviation + primitive.renderingModeArgument * primitive.renderingModeArgument
+        )
+        : deviation
+        shadow.renderingModeArgument = blur
+        shadow.blurred = true
+        let spread = blur * PrimitiveShadows.edgeSpread
+        if side < spread {
+            let share = side / spread
+            alpha = share / (share * PrimitiveShadows.narrowSlope + PrimitiveShadows.narrowBase)
+        }
+    }
+    if inverse {
+        invert(shadow)
+    }
+    shadow.coversByAlpha = true
+    return .Some(ShadowedPrimitive { primitive: shadow, alpha: alpha })
+}
+
+// The primitive's corners rounded out to hold a blur of `deviation`, and the
+// width the blur may spread over before the shape thins: its shorter side, an
+// ellipse's diameter, a line's width.
+function shadowCorners(shadow: borrow mut Primitive, deviation: Number) -> Number? {
+    let spread = deviation * PrimitiveShadows.cornerSpread
+    let rect = shadow.rect
+    let shorter = min(rect.width, rect.height)
+    return match shadow.kind {
+        Rect -> {
+            if shadow.lineWidth > 0 {
+                return .None
+            }
+            shadow.kind = .RoundedRect
+            let corner = min(spread, shorter * 0.5)
+            shadow.cornerRadii = CornerRadii {
+                topLeft: corner,
+                topRight: corner,
+                bottomRight: corner,
+                bottomLeft: corner
+            }
+            return .Some(shorter)
+        }
+        RoundedRect -> roundedShadowCorners(shadow, spread, 1)
+        ContinuousRoundedRect -> roundedShadowCorners(
+            shadow,
+            spread,
+            PrimitiveGeometry.continuousCornerExtent
+        )
+        Ellipse -> {
+            if shadow.horizontalScale != 1 {
+                return .None
+            }
+            let diameter = shadow.cornerRadii.topLeft * 2
+            return .Some(shadow.lineWidth > 0 ? min(shadow.lineWidth, diameter) : diameter)
+        }
+        ButtLine -> lineShadowCorners(shadow, spread)
+        RoundLine -> lineShadowCorners(shadow, spread)
+        SquareLine -> lineShadowCorners(shadow, spread)
+        Empty -> .Some(shorter)
+        Infinite -> .Some(shorter)
+    }
+}
+
+// A filled, unsqueezed rounded rect: each corner, as a circular one, grown
+// to the blur's spread, held within half the shorter side, then stretched
+// back by `extent`.
+function roundedShadowCorners(
+    shadow: borrow mut Primitive,
+    spread: Number,
+    extent: Number
+) -> Number? {
+    if shadow.horizontalScale != 1 || shadow.lineWidth > 0 {
+        return .None
+    }
+    let shorter = min(shadow.rect.width, shadow.rect.height)
+    let limit = shorter * 0.5
+    let radii = shadow.cornerRadii
+    shadow.cornerRadii = CornerRadii {
+        topLeft: min(grownCorner(radii.topLeft / extent, spread), limit) * extent,
+        topRight: min(grownCorner(radii.topRight / extent, spread), limit) * extent,
+        bottomRight: min(grownCorner(radii.bottomRight / extent, spread), limit) * extent,
+        bottomLeft: min(grownCorner(radii.bottomLeft / extent, spread), limit) * extent
+    }
+    return .Some(shorter)
+}
+
+// A line's caps grown the same way, held within half its width.
+function lineShadowCorners(shadow: borrow mut Primitive, spread: Number) -> Number? {
+    let limit = shadow.lineWidth * 0.5
+    let radii = shadow.cornerRadii
+    shadow.cornerRadii = CornerRadii {
+        topLeft: min(grownCorner(radii.topLeft, spread), limit),
+        topRight: min(grownCorner(radii.topRight, spread), limit),
+        bottomRight: min(grownCorner(radii.bottomRight, spread), limit),
+        bottomLeft: min(grownCorner(radii.bottomLeft, spread), limit)
+    }
+    return .Some(shadow.lineWidth)
+}
+
+function grownCorner(radius: Number, spread: Number) -> Number {
+    return radius > 0 ? sqrt(spread * spread + radius * radius) : spread
+}
+
+// An empty primitive inverted covers everything, an infinite one nothing;
+// any other covers what lies outside it.
+function invert(shadow: borrow mut Primitive) {
+    match shadow.kind {
+        Empty -> shadow.kind = .Infinite
+        Infinite -> shadow.kind = .Empty
+        Rect -> shadow.inverted = !shadow.inverted
+        RoundedRect -> shadow.inverted = !shadow.inverted
+        ContinuousRoundedRect -> shadow.inverted = !shadow.inverted
+        Ellipse -> shadow.inverted = !shadow.inverted
+        ButtLine -> shadow.inverted = !shadow.inverted
+        RoundLine -> shadow.inverted = !shadow.inverted
+        SquareLine -> shadow.inverted = !shadow.inverted
+    }
+}

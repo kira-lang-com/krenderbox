@@ -1,0 +1,80 @@
+import Foundation
+import RenderBox
+
+function unitRect() -> Shape {
+    var shape = Shape()
+    shape.setRect(Rect { width: 1, height: 1 })
+    return shape
+}
+
+@Test
+function restoreUndoesTheTransform() {
+    expect!(restoreUndoesTheTransformResult() == "0 true")
+}
+
+function restoreUndoesTheTransformResult() -> String {
+    var list = DisplayList()
+    list.save()
+    list.translateBy(5, 7)
+    let restored = list.restore()
+    list.drawShape(unitRect(), Fill(), 1, .Normal)
+    let contents = list.moveContents()
+    return match contents.items[0] {
+        Shape(item) -> "\(item.state.transform.tx) \(restored == .Ok)"
+        Layer(item) -> "layer"
+    }
+}
+
+@Test
+function restoreWithoutSaveFails() {
+    expect!(restoreWithoutSaveFailsResult() == "DisplayListFailure.NoSavedState")
+}
+
+function restoreWithoutSaveFailsResult() -> String {
+    var list = DisplayList()
+    return match list.restore() {
+        Ok -> "restored"
+        Error(failure) -> traceText(failure)
+    }
+}
+
+@Test
+function layerCollectsItsDrawsIntoOneItem() {
+    expect!(layerCollectsItsDrawsIntoOneItemResult() == "2 layer 2 0.5 shape 0 true")
+}
+
+function layerCollectsItsDrawsIntoOneItemResult() -> String {
+    var list = DisplayList()
+    list.beginLayer(LayerFlags.none)
+    list.translateBy(3, 0)
+    list.drawShape(unitRect(), Fill(), 1, .Normal)
+    list.drawShape(unitRect(), Fill(), 1, .Normal)
+    let drawn = list.drawLayer(0.5, .PlusLighter)
+    list.drawShape(unitRect(), Fill(), 1, .Normal)
+    let contents = list.moveContents()
+    let first = match contents.items[0] {
+        Shape(item) -> "shape"
+        Layer(item) -> "layer \(item.contents.items.count) \(item.alpha)"
+    }
+    let second = match contents.items[1] {
+        Shape(item) -> "shape \(item.state.transform.tx)"
+        Layer(item) -> "layer"
+    }
+    return "\(contents.items.count) \(first) \(second) \(drawn == .Ok)"
+}
+
+@Test
+function linearLayerDropsNonLinear() {
+    expect!(linearLayerDropsNonLinearResult() == 4)
+}
+
+function linearLayerDropsNonLinearResult() -> Number {
+    var list = DisplayList()
+    list.beginLayer(LayerFlags.linear.union(LayerFlags.nonLinear))
+    let drawn = list.drawLayer(1, .Normal)
+    let contents = list.moveContents()
+    return match contents.items[0] {
+        Shape(item) -> 0
+        Layer(item) -> Number(item.contents.flags.raw)
+    }
+}

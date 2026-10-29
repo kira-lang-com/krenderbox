@@ -1,0 +1,63 @@
+import Foundation
+import Ember
+
+// GradientGlobals' floats past the gradient's own: the layer as the source,
+// the map from its channel to a position, the target's scale and the
+// channel.
+namespace GradientMapFloats {
+    let fromLayer: Number = 23
+    let valueMap: Number = 24
+    let targetScale: Number = 26
+    let component: Number = 28
+    // render_'s scale when the range is empty.
+    let emptyRangeScale: Number = 1000000
+    let pipeline: String = "renderbox-gradient-map"
+}
+
+// GenericFilter<AlphaGradientEffect>::render: every pixel of `source`
+// replaced by the alpha gradient's colour at its channel's place in the
+// range. The filter draws at full opacity; the result is composited at
+// `opacity` after.
+function gradientMapped(
+    session: borrow mut RenderSession,
+    source: GraphicsTexture,
+    style: borrow GradientMapStyle,
+    opacity: Number
+) -> Result<(GraphicsTexture, Number), RenderFailure> {
+    let colors = try gradientColors(session, style.gradient, 1)
+    let floats = gradientMapFloats(session, style, colors)
+    let pipeline = try namedPipeline(
+        session,
+        GradientMapFloats.pipeline,
+        ksl!("Shaders/Gradient.ksl"),
+        ColorTargetDescriptor { format: session.format, blend: BlendState { enabled: false } }
+    )
+    let bindGroup = try boundGradient(session, move floats, colors.stops, source)
+    let draw = RecordedDraw {
+        pipeline: pipeline,
+        bindGroup: bindGroup,
+        vertexCount: GradientDrawing.vertexCount
+    }
+    let target = try surface(session, "renderbox-gradient-map")
+    try drawPass(session, target, Surfaces.transparent, [draw])
+    return .Ok((target, opacity))
+}
+
+// render_'s AlphaEffectGlobals: the position is the channel times one over
+// the range's length, less its low end over that length.
+function gradientMapFloats(
+    session: borrow RenderSession,
+    style: borrow GradientMapStyle,
+    colors: borrow GradientColorGlobals
+) -> [Number] {
+    let length = style.high - style.low
+    let scale = length == 0 ? GradientMapFloats.emptyRangeScale : 1 / length
+    var floats = gradientFloats(GradientGeometryGlobals(), colors, gradientKind(style.gradient))
+    floats[GradientMapFloats.fromLayer] = 1
+    floats[GradientMapFloats.valueMap] = scale
+    floats[GradientMapFloats.valueMap + 1] = -style.low * scale
+    floats[GradientMapFloats.targetScale] = 1 / Number(session.width)
+    floats[GradientMapFloats.targetScale + 1] = 1 / Number(session.height)
+    floats[GradientMapFloats.component] = Number(code(style.component))
+    return floats
+}

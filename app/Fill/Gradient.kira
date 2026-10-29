@@ -1,0 +1,104 @@
+import Foundation
+
+// RB::Fill::Gradient::Stop. A curve's stop eases the colour to the next so
+// that it is halfway at `midpoint`, a fraction of the way there; a cubic's
+// eases it along `timing`. The last stop's are not read.
+public struct GradientStop {
+    let color: RGBAColor
+    let location: Number
+    var midpoint: Number = 0.5
+    var timing: StopTiming = StopTiming()
+}
+
+// A cubic stop's timing curve, from (0, 0) to (1, 1) through (x1, y1) and
+// (x2, y2), each a byte of 255ths as the stop keeps it: the straight line
+// unless given.
+public struct StopTiming {
+    var x1: Number = 0
+    var y1: Number = 0
+    var x2: Number = 1
+    var y2: Number = 1
+}
+
+// Gradient's constructor's timing: each coordinate clamped to [0, 1] and
+// rounded to 255ths.
+public function stopTiming(x1: Number, y1: Number, x2: Number, y2: Number) -> StopTiming {
+    return StopTiming {
+        x1: timingByte(x1),
+        y1: timingByte(y1),
+        x2: timingByte(x2),
+        y2: timingByte(y2)
+    }
+}
+
+function timingByte(value: Number) -> Number {
+    return trunc(clamp(value, 0, 1) * 255 + 0.5) / 255
+}
+
+extend StopTiming {
+    // The straight line, (0, 0, 255, 255) as bytes.
+    function straight() -> Bool {
+        return x1 == 0 && y1 == 0 && x2 == 1 && y2 == 1
+    }
+}
+
+// What a gradient does past its first and last stop: the low three bits of
+// RB::Fill::Gradient's flags.
+public enum GradientEdgeMode: UN16 {
+    Clamp = 0
+    Repeat = 1
+    Mirror = 2
+    Unclamped = 3
+}
+
+// How colour runs between stops: bits eight to eleven of the flags. A
+// curve and a cubic ease each segment by its stop; a smooth gradient runs
+// along cubics through the stops.
+public enum GradientInterpolation: UN16 {
+    Linear = 0
+    Curve = 1
+    Cubic = 2
+    Smooth = 4
+}
+
+public struct AxialGradient {
+    let startPoint: Point
+    let endPoint: Point
+}
+
+public struct RadialGradient {
+    let startCenter: Point
+    let startRadius: Number
+    let endCenter: Point
+    let endRadius: Number
+}
+
+public struct ConicGradient {
+    let center: Point
+    let angle: Number
+}
+
+public struct AngularGradient {
+    let center: Point
+    let startAngle: Number
+    let endAngle: Number
+}
+
+// RB::Fill::Gradient's types, in its order.
+public enum GradientGeometry {
+    Axial(AxialGradient)
+    Radial(RadialGradient)
+    Conic(ConicGradient)
+    Alpha
+    Angular(AngularGradient)
+}
+
+public struct Gradient {
+    let geometry: GradientGeometry
+    let stops: [GradientStop]
+    let colorSpace: ColorSpace
+    let edgeMode: GradientEdgeMode
+    let interpolation: GradientInterpolation
+    // Bits six and seven of the flags.
+    let space: ColorInterpolation = .Device
+}

@@ -1,0 +1,62 @@
+import Foundation
+import RenderBox
+
+function primitiveOf(shape: borrow Shape) -> Primitive? {
+    return match shape.data {
+        Primitive(primitive) -> .Some(copy primitive)
+        FilledPath(path) -> .None
+        StrokedPath(path) -> .None
+    }
+}
+
+function roundedRect(
+    width: Number,
+    height: Number,
+    radius: Number,
+    style: RoundedCornerStyle
+) -> Primitive? {
+    var shape = Shape()
+    shape.setRoundedRect(Rect { width: width, height: height }, radius, style)
+    return primitiveOf(shape)
+}
+
+@Test
+function circularCornersStayCircular() {
+    expect!(circularCornersStayCircularResult() == "3 10 1")
+}
+
+function circularCornersStayCircularResult() -> String {
+    let primitive = try roundedRect(100, 60, 10, .Circular) otherwise return "no primitive"
+    return "\(code(primitive.kind)) \(primitive.cornerRadii.topLeft) \(primitive.horizontalScale)"
+}
+
+// set_rounded_rect scales a continuous corner by 1.275 and keeps its kind.
+@Test
+function continuousCornersReachFurther() {
+    expect!(continuousCornersReachFurtherResult() == "4 25.49999952316284")
+}
+
+function continuousCornersReachFurtherResult() -> String {
+    let primitive = try roundedRect(100, 100, 20, .Continuous) otherwise return "no primitive"
+    return "\(code(primitive.kind)) \(primitive.cornerRadii.topLeft)"
+}
+
+@Test
+function cornerRadiusIsClampedToHalfTheEdge() {
+    expect!(cornerRadiusIsClampedToHalfTheEdgeResult() == "20")
+}
+
+function cornerRadiusIsClampedToHalfTheEdgeResult() -> String {
+    let primitive = try roundedRect(40, 100, 30, .Circular) otherwise return "no primitive"
+    return "\(primitive.cornerRadii.topLeft)"
+}
+
+@Test
+function squareWithMeetingCornersIsAnEllipse() {
+    expect!(squareWithMeetingCornersIsAnEllipseResult() == "5")
+}
+
+function squareWithMeetingCornersIsAnEllipseResult() -> String {
+    let primitive = try roundedRect(50, 50, 25, .Circular) otherwise return "no primitive"
+    return "\(code(primitive.kind))"
+}

@@ -1,0 +1,195 @@
+import Foundation
+
+namespace ShadowDrawing {
+    // ShadowStyle::draw blurs only past this deviation, and takes the
+    // colour matrix within this of an even midpoint.
+    let smallestRadius: Number = 0.01
+    let evenMidpoint: Number = 0.5
+    let midpointTolerance: Number = 0.01
+}
+
+// ShadowStyle::draw for each item whose last style is a shadow: the item
+// becomes the shadow and the item, in the order the flags give, or the
+// shadow alone. What it becomes may cast a shadow of its own in turn.
+function shadowsLowered(items: borrow [Item]) -> Result<[Item], RenderFailure> {
+    var lowered: [Item] = []
+    var changed = false
+    for item in items {
+        let state = itemState(item)
+        let shadow = match lastShadow(state) {
+            Some(shadow) -> shadow
+            None -> {
+                lowered.append(copy item)
+                continue
+            }
+        }
+        lowered.appendAll(try shadowedItems(item, shadow, state))
+        changed = true
+    }
+    return changed ? shadowsLowered(lowered) : .Ok(lowered)
+}
+
+function itemState(item: borrow Item) -> DrawingState {
+    return match item {
+        Shape(shape) -> copy shape.state
+        Layer(layer) -> copy layer.state
+    }
+}
+
+function lastShadow(state: borrow DrawingState) -> ShadowStyle? {
+    if state.styles.count == 0 {
+        return .None
+    }
+    return match state.styles[state.styles.count - 1] {
+        Shadow(shadow) -> .Some(copy shadow)
+        ColorMatrix(matrix) -> .None
+        ColorClamp(clamp) -> .None
+        GradientMap(map) -> .None
+        Distance(distance) -> .None
+        ShaderFilter(filter) -> .None
+        AlphaThreshold(threshold) -> .None
+        Blur(blur) -> .None
+    }
+}
+
+// The item's state with its last style taken off.
+function withoutLastStyle(state: borrow DrawingState) -> DrawingState {
+    var rest = copy state
+    let _ = rest.styles.popLast()
+    let _ = rest.styleClipCounts.popLast()
+    return rest
+}
+
+function itemPaint(item: borrow Item) -> (Number, BlendMode) {
+    return match item {
+        Shape(shape) -> (shape.alpha, shape.blendMode)
+        Layer(layer) -> (layer.alpha, layer.blendMode)
+    }
+}
+
+// The item with another state, alpha and blend.
+function restated(item: borrow Item, state: DrawingState, alpha: Number, blend: BlendMode) -> Item {
+    return match item {
+        Shape(shape) -> .Shape(
+            ShapeItem {
+                shape: copy shape.shape,
+                fill: copy shape.fill,
+                headroom: shape.headroom,
+                alpha: alpha,
+                blendMode: blend,
+                state: state
+            }
+        )
+        Layer(layer) -> .Layer(
+            LayerItem {
+                contents: copy layer.contents,
+                alpha: alpha,
+                blendMode: blend,
+                state: state
+            }
+        )
+    }
+}
+
+// A clear shadow the blend may stop at draws nothing. Otherwise, unless the
+// flags keep them apart, an item drawn at less than full alpha or through
+// another blend, or a shadow through another blend, is drawn with its
+// shadow into a layer that takes the item's alpha and blend.
+function shadowedItems(
+    item: borrow Item,
+    shadow: borrow ShadowStyle,
+    state: borrow DrawingState
+) -> Result<[Item], RenderFailure> {
+    let rest = withoutLastStyle(state)
+    let (alpha, blend) = itemPaint(item)
+    let only = shadow.flags.has(ShadowFlags.only)
+    if shadow.color.a == 0 && mayDiscardAlpha(shadow.blendMode) {
+        return .Ok(only ? [] : [restated(item, move rest, alpha, blend)])
+    }
+    if shadow.flags.has(ShadowFlags.knockout) {
+        return .Error(.UnportedStyle)
+    }
+    let plain = blend == .Normal && alpha == 1 && shadow.blendMode == .Normal
+    let apart = only || shadow.flags.has(ShadowFlags.layer)
+    let wraps = !apart && !plain
+    let cast = try castShadow(item, shadow, rest, wraps ? 1 : alpha)
+    if only {
+        return .Ok([cast])
+    }
+    let original = wraps ? restated(item, copy rest, 1, .Normal) : restated(
+        item,
+        copy rest,
+        alpha,
+        blend
+    )
+    let ordered = shadow.flags.has(ShadowFlags.above) ? [original, cast] : [cast, original]
+    if !wraps {
+        return .Ok(ordered)
+    }
+    return wrapped(
+        ordered,
+        rest,
+        alpha,
+        blend,
+        state.styleClipCounts[state.styleClipCounts.count - 1]
+    )
+}
+
+// The shadow and the item in a layer of their own: the clips added after the
+// shadow clip each, the ones before it the layer. A style before the shadow
+// would filter the layer, which is not ported.
+function wrapped(
+    ordered: borrow [Item],
+    rest: borrow DrawingState,
+    alpha: Number,
+    blend: BlendMode,
+    clipCount: UNumber
+) -> Result<[Item], RenderFailure> {
+    if rest.styles.count > 0 {
+        return .Error(.UnportedStyle)
+    }
+    let inner = clipsBetween(rest.clips, clipCount, rest.clips.count)
+    var items: [Item] = []
+    for item in ordered {
+        let (itemAlpha, itemBlend) = itemPaint(item)
+        var state = itemState(item)
+        state.clips = copy inner
+        items.append(restated(item, move state, itemAlpha, itemBlend))
+    }
+    let state = DrawingState {
+        transform: copy rest.transform,
+        clips: clipsBetween(rest.clips, 0, clipCount),
+        contentHeadroom: rest.contentHeadroom
+    }
+    let layer = LayerItem {
+        contents: LayerContents { items: items },
+        alpha: alpha,
+        blendMode: blend,
+        state: state
+    }
+    return .Ok([.Layer(layer)])
+}
+
+// The offset, in the shadow's space, as a move of the device's.
+function shadowOffset(shadow: borrow ShadowStyle) -> AffineTransform {
+    let t = shadow.transform
+    let x = shadow.offset.width
+    let y = shadow.offset.height
+    return AffineTransform { tx: t.a * x + t.c * y, ty: t.b * x + t.d * y }
+}
+
+// GenericItem<Primitive, Color>::copy_shadow, then the layer
+// ShadowStyle::draw falls back to: a copy of the item blurred, its alpha
+// painted the shadow's colour.
+function castShadow(
+    item: borrow Item,
+    shadow: borrow ShadowStyle,
+    state: borrow DrawingState,
+    alpha: Number
+) -> Result<Item, RenderFailure> {
+    let fast = try primitiveShadow(item, shadow, state, alpha)
+    return match fast {
+        Some(cast) -> .Ok(cast)
+        None -> layerShadow(item, shadow, state, alpha)
+    }
+}

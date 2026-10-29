@@ -1,0 +1,272 @@
+// RenderBox's accumulator fragments: a plane over a path's bounds reads the
+// winding the path's edges accumulated, turns it into coverage by the fill
+// rule (accumulator_shape) and paints through it.
+//
+// RenderBox reads the accumulator from the tile it is drawing into; here it is
+// the texture the edges were summed into, sampled at the same pixel's centre
+// with a nearest sampler.
+
+type AccumulatorGlobals {
+    // The plane's rect in clip space: min.xy, max.xy.
+    let plane: Float4
+    let depth: Float
+    // 1 for the even-odd rule, 0 for non-zero.
+    let evenOdd: Float
+    // 1 when the accumulator holds coverage itself, as a stroke's does.
+    let rawCoverage: Float
+    // The distance rendering mode's shape: 0 for none, 1 inner, 2 outer,
+    // 3 signed.
+    let distance: Float
+    // The fill colour, premultiplied; a texture fill's texels are multiplied
+    // by it.
+    let color: Float4
+    // Device pixel to the fill texture's coordinates:
+    // x * fillMatrix.xy + y * fillMatrix.zw + fillTranslation.
+    let fillMatrix: Float4
+    let fillTranslation: Float2
+    // 1 when the fill is the texture, 0 when it is the colour alone.
+    let textured: Float
+    // 1 when the clip mask's alpha multiplies coverage.
+    let masked: Float
+    // Device pixel to the clip mask's coordinates.
+    let maskScale: Float2
+    // Device pixel to the accumulator's coordinates: one over the target's
+    // size.
+    let targetScale: Float2
+    // Image::sample's conversion of the fill texture's texels: whether to
+    // convert, decode and encode, then the primaries' matrix by column.
+    let conversion: Float4
+    let fromRed: Float4
+    let fromGreen: Float4
+    let fromBlue: Float4
+}
+
+// RB::Shader::Image::sample's conversion of a texel from the image's colour
+// space into the pass's: unpremultiplied where its alpha is above a half's
+// 0x1419, decoded by RB::Shader::Tables, through the primaries' matrix,
+// encoded by the tables and premultiplied again. A table's entry is the sRGB
+// transfer at the middle of the eight halves sharing a half's bits over
+// eight, rounded to a half, as `app/Render/TransferTables.kira` builds it.
+const halfSmallest: Float = 0.00006103515625
+const halfTiny: Float = 0.000000059604644775390625
+const unpremultiplyBelow: Float = 0.0010004
+const tableOne: Float = 1920.0
+const tableInfinite: Float = 3968.0
+
+// A half's bits for the half nearest `value`, which is not negative.
+function halfBits(value: Float) -> Float {
+    if value < halfSmallest {
+        return round(value / halfTiny)
+    }
+    let exponent = floor(log2(value))
+    if exp2(exponent) > value {
+        exponent = exponent - 1.0
+    }
+    if exp2(exponent + 1.0) <= value {
+        exponent = exponent + 1.0
+    }
+    let mantissa = round((value / exp2(exponent) - 1.0) * 1024.0)
+    return (exponent + 15.0) * 1024.0 + mantissa
+}
+
+function halfValue(bits: Float) -> Float {
+    let exponent = floor(bits / 1024.0)
+    let mantissa = bits - exponent * 1024.0
+    if exponent == 0.0 {
+        return mantissa * halfTiny
+    }
+    return (1.0 + mantissa / 1024.0) * exp2(exponent - 15.0)
+}
+
+function srgbEncoded(x: Float) -> Float {
+    if x <= 0.0031308 {
+        return x * 12.92
+    }
+    return pow(x, 0.41667) * 1.055 - 0.055
+}
+
+function srgbDecoded(x: Float) -> Float {
+    if x <= 0.04045 {
+        return x * 0.07739938
+    }
+    return pow(x * 0.9478673 + 0.0521327, 2.4)
+}
+
+// The table's entry for `value`, keeping its sign.
+function tableEntry(value: Float, decoding: Bool) -> Float {
+    let index = floor(halfBits(abs(value)) / 8.0)
+    if index == 0.0 || index >= tableInfinite {
+        return value
+    }
+    let entry = 1.0
+    if index != tableOne {
+        let x = halfValue(index * 8.0 + 4.0)
+        let mapped = srgbEncoded(x)
+        if decoding {
+            mapped = srgbDecoded(x)
+        }
+        entry = halfValue(halfBits(mapped))
+    }
+    if value < 0.0 {
+        return -entry
+    }
+    return entry
+}
+
+// `texel` converted by `flags` (whether to convert, decode, encode) and the
+// primaries' columns.
+function convertedTexel(texel: Float4, flags: Float4, fromRed: Float4, fromGreen: Float4, fromBlue: Float4) -> Float4 {
+    if flags.x == 0.0 {
+        return texel
+    }
+    let alpha = texel.w
+    let rgb = Float3(0.0, 0.0, 0.0)
+    if alpha > unpremultiplyBelow {
+        rgb = texel.xyz / alpha
+    }
+    if flags.y == 1.0 {
+        rgb = Float3(tableEntry(rgb.x, true), tableEntry(rgb.y, true), tableEntry(rgb.z, true))
+    }
+    rgb = fromRed.xyz * rgb.x + fromGreen.xyz * rgb.y + fromBlue.xyz * rgb.z
+    if flags.z == 1.0 {
+        rgb = Float3(tableEntry(rgb.x, false), tableEntry(rgb.y, false), tableEntry(rgb.z, false))
+    }
+    return Float4(rgb * alpha, alpha)
+}
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+}
+
+type FragmentOut {
+    let color: Half4
+}
+
+// accumulator_shape for the fill rules: non-zero saturates the winding's
+// magnitude; even-odd folds it so odd windings cover and even ones do not.
+function windingCoverage(winding: Float, evenOdd: Float) -> Float {
+    let magnitude = abs(winding)
+    if evenOdd == 0.0 {
+        return clamp(magnitude, 0.0, 1.0)
+    }
+    let part = fract(magnitude)
+    let whole = magnitude - part
+    if whole - floor(whole / 2.0) * 2.0 == 0.0 {
+        return part
+    }
+    return 1.0 - part
+}
+
+// accumulator_shape for the distance rendering modes: the accumulator holds
+// the winding path_interior added in its whole part and how near the path's
+// outline the pixel is in its fraction. Inside the fill rule an inner shape
+// falls off towards the outline and an outer one covers wholly; outside, an
+// outer shape falls off away from it and an inner one covers nothing. A
+// signed shape is half of each.
+function distanceCoverage(value: Float, evenOdd: Float, shape: Float) -> Float {
+    let whole = floor(value)
+    let near = value - whole
+    let inside = whole != 0.0
+    if evenOdd != 0.0 {
+        let count = abs(whole)
+        inside = count - floor(count / 2.0) * 2.0 != 0.0
+    }
+    if shape == 1.0 {
+        if inside {
+            return 1.0 - near
+        }
+        return 0.0
+    }
+    if shape == 2.0 {
+        if inside {
+            return 1.0
+        }
+        return near
+    }
+    if inside {
+        return 1.0 - near * 0.5
+    }
+    return near * 0.5
+}
+
+shader Accumulator {
+    group Paint {
+        uniform globals: AccumulatorGlobals
+        texture accumulator: Texture2d
+        sampler accumulatorSampler: Sampler
+        texture fill: Texture2d
+        sampler fillSampler: Sampler
+        texture mask: Texture2d
+        sampler maskSampler: Sampler
+    }
+
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        // Two triangles over the plane's corners 0 1 2 and 0 2 3.
+        function entry(input: VertexIn) -> VertexOut {
+            let corner = input.vid
+            if input.vid == UInt(3) {
+                corner = UInt(0)
+            }
+            if input.vid > UInt(3) {
+                corner = input.vid - UInt(2)
+            }
+            let x = globals.plane.x
+            if corner == UInt(1) || corner == UInt(2) {
+                x = globals.plane.z
+            }
+            let y = globals.plane.y
+            if corner > UInt(1) {
+                y = globals.plane.w
+            }
+            let out: VertexOut
+            out.clip_position = Float4(x, y, globals.depth, 1.0)
+            return out
+        }
+    }
+
+    fragment {
+        input VertexOut
+        output FragmentOut
+
+        function entry(input: VertexOut) -> FragmentOut {
+            let device = input.clip_position.xy
+            let texel = (floor(device) + 0.5) * globals.targetScale
+            let winding = sample(accumulator, accumulatorSampler, texel).y
+            let covered = windingCoverage(winding, globals.evenOdd)
+            if globals.distance != 0.0 {
+                covered = distanceCoverage(winding, globals.evenOdd, globals.distance)
+            }
+            if globals.rawCoverage == 1.0 {
+                covered = winding
+            }
+            let uv = globals.fillMatrix.xy * device.x + globals.fillMatrix.zw * device.y + globals.fillTranslation
+            let filled = convertedTexel(
+                sample(fill, fillSampler, uv),
+                globals.conversion,
+                globals.fromRed,
+                globals.fromGreen,
+                globals.fromBlue
+            )
+            let clipped = sample(mask, maskSampler, device * globals.maskScale).w
+            let paint = globals.color
+            if globals.textured == 1.0 {
+                paint = filled * globals.color
+            }
+            if globals.masked == 1.0 {
+                covered = covered * clipped
+            }
+            let result: FragmentOut
+            result.color = Half4(paint * covered)
+            return result
+        }
+    }
+}

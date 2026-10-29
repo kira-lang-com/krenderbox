@@ -1,0 +1,165 @@
+import Foundation
+
+// What set_gradient_color reads: the stops in the space colour runs in,
+// how it runs between them, and whether their locations are uneven, as the
+// flags' bit 15 says.
+struct InterpolatedStops {
+    let stops: [GradientStop]
+    let interpolation: GradientInterpolation
+    let uneven: Bool
+}
+
+// set_gradient_color and set_fill_state's colour half: the stops, a
+// cubic's cut into curves, in the space colour runs in, moved into an
+// angular gradient's arc, then as the shader reads them.
+function gradientColors(
+    session: borrow RenderSession,
+    gradient: borrow Gradient,
+    opacity: Number
+) -> Result<GradientColorGlobals, RenderFailure> {
+    let conversion = try interpolationConversion(
+        session,
+        gradient.colorSpace,
+        gradient.space,
+        opacity
+    )
+    let interpolated = arcStops(gradient, interpolatedStops(gradient, conversion))
+    var globals = colorGlobals(gradient, interpolated, conversion)
+    let (colorOut, table) = gradientColorOut(session, gradient, opacity)
+    globals.colorOut = colorOut
+    globals.table = table
+    return .Ok(globals)
+}
+
+function interpolatedStops(
+    gradient: borrow Gradient,
+    conversion: borrow InterpolationConversion
+) -> InterpolatedStops {
+    var stops: [GradientStop] = []
+    for stop in gradient.stops {
+        stops.append(
+            GradientStop {
+                color: conversion.spaced(stop.color),
+                location: stop.location,
+                midpoint: stop.midpoint,
+                timing: copy stop.timing
+            }
+        )
+    }
+    let interpolation = constructedInterpolation(gradient)
+    if interpolation == .Cubic && stops.count > 1 {
+        return InterpolatedStops {
+            stops: subdividedStops(stops),
+            interpolation: .Curve,
+            uneven: true
+        }
+    }
+    return InterpolatedStops {
+        stops: stops,
+        interpolation: interpolation,
+        uneven: angular(gradient) || !evenlySpacedStops(gradient.stops)
+    }
+}
+
+// set_fill_state's colour steps, as for a mesh but none for the device's
+// space: the table when colour ran in a space whose curve is not the
+// pass's, OKLab for a perceptual gradient, and nothing to unpremultiply
+// when every stop is opaque at full opacity, unless a two-point radial
+// gradient leaves pixels out.
+function gradientColorOut(
+    session: borrow RenderSession,
+    gradient: borrow Gradient,
+    opacity: Number
+) -> (Number, Number) {
+    let linearPass = session.colorSpace < 0x10
+    let table = match gradient.space {
+        Device -> false
+        Linear, Perceptual -> !linearPass
+        NonLinear -> linearPass
+    }
+    var bits = table ? 1 : 0
+    if gradient.space == .Perceptual {
+        bits += 4
+    }
+    var opaque = opacity == 1 && !twoPoint(gradient)
+    for stop in gradient.stops {
+        opaque = opaque && stop.color.a == 1
+    }
+    if table && opaque {
+        bits += 2
+    }
+    return (bits, linearPass ? TransferTables.decoding : TransferTables.encoding)
+}
+
+function twoPoint(gradient: borrow Gradient) -> Bool {
+    return match gradient.geometry {
+        Radial(radial) -> radial.startCenter != radial.endCenter
+        Axial(axial) -> false
+        Conic(conic) -> false
+        Alpha -> false
+        Angular(arc) -> false
+    }
+}
+
+// set_gradient_color's stops for an angular gradient: each location moved
+// into the part of the turn its arc covers, and a curve's midpoints, a
+// cubic's cut ones too, with them.
+function arcStops(gradient: borrow Gradient, interpolated: InterpolatedStops) -> InterpolatedStops {
+    let arc = match gradient.geometry {
+        Angular(arc) -> arc
+        Axial(axial) -> return interpolated
+        Radial(radial) -> return interpolated
+        Conic(conic) -> return interpolated
+        Alpha -> return interpolated
+    }
+    let (low, span) = angularLocations(arc)
+    var moved: [GradientStop] = []
+    for stop in interpolated.stops {
+        moved.append(
+            GradientStop {
+                color: copy stop.color,
+                location: floatRounded(low + span * stop.location),
+                midpoint: stop.midpoint,
+                timing: copy stop.timing
+            }
+        )
+    }
+    if interpolated.interpolation == .Curve {
+        movedMidpoints(moved, gradient.stops, low, span)
+    }
+    return InterpolatedStops {
+        stops: moved,
+        interpolation: interpolated.interpolation,
+        uneven: interpolated.uneven
+    }
+}
+
+// Each midpoint where its place in the gradient's own segment lands in the
+// moved one, the segment found by the moved stop's index.
+function movedMidpoints(
+    moved: borrow mut [GradientStop],
+    given: borrow [GradientStop],
+    low: Number,
+    span: Number
+) {
+    for index in 0..moved.count - 1 {
+        let length = moved[index + 1].location - moved[index].location
+        let from = givenLocation(given, index)
+        let segment = givenLocation(given, index + 1) - from
+        let along = from + moved[index].midpoint * segment
+        let offset = low - moved[index].location + span * along
+        moved[index].midpoint = length == 0 ? 1 : floatRounded(offset / length)
+    }
+}
+
+// The location set_gradient_color reads at `index` of the gradient's own
+// stops. A cubic's cut stops outnumber them, and RenderBox indexes them by
+// the cut stops anyway, reading past their end: the inline slots after
+// them hold zero, and what lies beyond those changes from run to run, so
+// zero is what it reads.
+function givenLocation(given: borrow [GradientStop], index: Number) -> Number {
+    if index < given.count {
+        return given[index].location
+    }
+    return 0
+}

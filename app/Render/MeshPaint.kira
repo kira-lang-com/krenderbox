@@ -1,0 +1,184 @@
+import Foundation
+import Ember
+
+// `group Fill` in `Shaders/MeshGradient.ksl`, its bindings in order.
+namespace MeshDrawing {
+    let globalsBinding: UN32 = 0
+    let meshBinding: UN32 = 1
+    let noiseBinding: UN32 = 2
+    let noiseSamplerBinding: UN32 = 3
+    let transferBinding: UN32 = 4
+    let globalsFloatCount: UN32 = 20
+    let backgroundVertices: UN32 = 6
+    // A cell's two triangles.
+    let cellVertices: Number = 6
+    // make_buffers: at most 2^7 cells to a patch's side, and at most this
+    // many cells in all.
+    let deepestLevel: Number = 7
+    let mostCells: Number = 0x10000
+    // What the patch index adds to the depth, above the cleared depth.
+    let depthBase: Number = 1
+    let depthPipeline: String = "renderbox-mesh-depth"
+    let colorPipeline: String = "renderbox-mesh-color"
+    let trianglePipeline: String = "renderbox-mesh-triangles"
+    let backgroundPipeline: String = "renderbox-mesh-background"
+}
+
+// What the mesh draws: its patches' or triangles' floats, how many vertices,
+// and the shader's mode for them.
+struct MeshGeometry {
+    let floats: [Number]
+    let vertices: Number
+    let mode: Number
+    let level: Number
+}
+
+// render_mesh_gradient drawn through `transform` at `opacity`, as paint:
+// the mesh's colour at every pixel of a surface the coverage then samples.
+// Its patches draw twice, keeping first the latest depth at each pixel and
+// then the colour of the fragment there; the background fills what none
+// drew.
+function meshPaint(
+    session: borrow mut RenderSession,
+    mesh: borrow MeshGradient,
+    transform: borrow AffineTransform,
+    opacity: Number
+) -> Result<Paint, RenderFailure> {
+    let toDevice = mesh.transform.concatenating(transform)
+    let conversion = try meshColorConversion(session, mesh, opacity)
+    var colors: [RGBAColor] = []
+    for color in mesh.colors {
+        colors.append(conversion.converted(color))
+    }
+    let geometry = mesh.valid() ? meshGeometry(session, mesh, colors, toDevice) : MeshGeometry {
+        floats: [],
+        vertices: 0,
+        mode: 0,
+        level: 0
+    }
+    let background = try meshBackground(session, mesh, opacity)
+    let state = meshColorOut(session, mesh, colors, opacity)
+    let surface = try floatSurface(session, "renderbox-mesh")
+    let draws = try meshDraws(session, geometry, toDevice, state, background)
+    try meshPass(session, surface, draws)
+    return .Ok(surfacePaint(session, move surface, 1))
+}
+
+// make_buffers: the patches, or the triangles, as the shader reads them.
+function meshGeometry(
+    session: borrow RenderSession,
+    mesh: borrow MeshGradient,
+    colors: borrow [RGBAColor],
+    toDevice: borrow AffineTransform
+) -> MeshGeometry {
+    let triangles = mesh.kind == .TriangleGrid || mesh.kind == .Triangles
+    if triangles {
+        var floats: [Number] = []
+        let vertices = meshTriangles(mesh, colors)
+        for vertex in vertices {
+            let c = vertex.color
+            floats.append(vertex.point.x)
+            floats.append(vertex.point.y)
+            for channel in [c.r, c.g, c.b, c.a] {
+                floats.append(channel)
+            }
+        }
+        return MeshGeometry { floats: floats, vertices: vertices.count, mode: 2, level: 0 }
+    }
+    let committed = meshPatches(mesh, colors, patchBounds(session, toDevice))
+    let level = meshLevel(committed, toDevice.lengthScale())
+    let side = pow(2, level)
+    let vertices = committed.patches.count * side * side * MeshDrawing.cellVertices
+    let mode = mesh.smooth && mesh.kind != .CoonsPatches && mesh.kind != .TensorPatches ? 1 : 0
+    return MeshGeometry {
+        floats: patchFloats(committed.patches),
+        vertices: vertices,
+        mode: mode,
+        level: level
+    }
+}
+
+// PatchBuffer's bounds: the target in the mesh's space.
+function patchBounds(session: borrow RenderSession, toDevice: borrow AffineTransform) -> Rect {
+    let target = Rect { width: Number(session.width), height: Number(session.height) }
+    let fromDevice = try toDevice.inverted() otherwise copy toDevice
+    return fromDevice.applying(target)
+}
+
+// make_buffers' level: the patches cut into 2^level cells a side, the
+// fewest that reach how far they are from flat at the transform's scale, no
+// more than 2^7, and fewer while there would be more than 2^16 cells.
+function meshLevel(committed: borrow MeshPatches, scale: Number) -> Number {
+    let flat = committed.flatness
+    let curve = sqrt(scale * 0.25 * sqrt(flat.x * flat.x + flat.y * flat.y))
+    var level: Number = 0
+    while level < MeshDrawing.deepestLevel && pow(2, level) < curve {
+        level += 1
+    }
+    while level > 0 && committed.patches.count * pow(4, level) > MeshDrawing.mostCells {
+        level -= 1
+    }
+    return level
+}
+
+// Each patch's sixteen points, then its sixteen colours: the corners first
+// and nothing after them for a bilinear patch.
+function patchFloats(patches: borrow [MeshPatch]) -> [Number] {
+    var floats: [Number] = []
+    for patch in patches {
+        for point in patch.points {
+            floats.append(point.x)
+            floats.append(point.y)
+        }
+        for index in 0..16 {
+            let color = index < patch.colors.count ? copy patch.colors[index] : RGBAColor { a: 0 }
+            for channel in [color.r, color.g, color.b, color.a] {
+                floats.append(channel)
+            }
+        }
+    }
+    return floats
+}
+
+// Color::prepare: the background in the pass's space, premultiplied, at
+// `opacity`.
+function meshBackground(
+    session: borrow RenderSession,
+    mesh: borrow MeshGradient,
+    opacity: Number
+) -> Result<RGBAColor, RenderFailure> {
+    let source = try spaceCode(mesh.colorSpace) otherwise session.colorSpace
+    let conversion = try colorConversion(source, 0, session.colorSpace, 0)
+    let color = conversion.converted(halfColor(mesh.background))
+    let alpha = halfRounded(color.a * opacity)
+    return .Ok(RGBAColor { r: color.r * alpha, g: color.g * alpha, b: color.b * alpha, a: alpha })
+}
+
+// set_fill_state's colour steps: the table when the colours ran in a space
+// whose curve is not the pass's, OKLab for a perceptual mesh, and nothing
+// to unpremultiply when they are all opaque. The table encodes into a pass
+// with the sRGB curve and decodes into a linear one.
+function meshColorOut(
+    session: borrow RenderSession,
+    mesh: borrow MeshGradient,
+    colors: borrow [RGBAColor],
+    opacity: Number
+) -> (Number, Number) {
+    let linearPass = session.colorSpace < 0x10
+    let table = match mesh.interpolation {
+        Device, NonLinear -> linearPass
+        Linear, Perceptual -> !linearPass
+    }
+    var bits = table ? 1 : 0
+    if mesh.interpolation == .Perceptual {
+        bits += 4
+    }
+    var opaque = opacity == 1
+    for color in mesh.colors {
+        opaque = opaque && color.a >= 1
+    }
+    if table && opaque {
+        bits += 2
+    }
+    return (bits, linearPass ? TransferTables.decoding : TransferTables.encoding)
+}

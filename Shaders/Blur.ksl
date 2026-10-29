@@ -1,0 +1,158 @@
+// RenderBox's filter_blur_fragment. Mode 0 reads once, where a downsampling
+// or upsampling pass maps the pixel; mode 2 sums four weighted reads around
+// it, a box downsample. The narrow modes, 4 to 7, are one direction of a
+// Gaussian, as pairs of linear reads either side of the pixel, 2, 4, 6 or 8
+// of them. RB::Filter::NarrowBlurKernel gives each read's offset, along the
+// pass's direction, and its weight; the centre is split between the first
+// pair.
+//
+// Positions are pixels: the target's pixel times `scale`, plus `offset`, read
+// clamped to [low, high] with a linear sampler.
+
+type BlurGlobals {
+    let scale: Float2
+    let offset: Float2
+    let low: Float2
+    let high: Float2
+    // The eight reads' offsets, two to a vector.
+    let taps01: Float4
+    let taps23: Float4
+    let taps45: Float4
+    let taps67: Float4
+    let weights0123: Float4
+    let weights4567: Float4
+    let count: Float
+    let mode: Float
+    // One over the source's size: a pixel position to the sampler's place.
+    let sourceScale: Float2
+    // 1 in x when the pass ends an opaque blur.
+    let flags: Float2
+}
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+}
+
+type FragmentOut {
+    let color: Half4
+}
+
+function tapOffset(g: BlurGlobals, index: Float) -> Float2 {
+    let set = g.taps67
+    if index < 2.0 {
+        set = g.taps01
+    } else {
+        if index < 4.0 {
+            set = g.taps23
+        } else {
+            if index < 6.0 {
+                set = g.taps45
+            }
+        }
+    }
+    if index - floor(index / 2.0) * 2.0 == 1.0 {
+        return set.zw
+    }
+    return set.xy
+}
+
+function tapWeight(g: BlurGlobals, index: Float) -> Float {
+    let set = g.weights0123
+    if index >= 4.0 {
+        set = g.weights4567
+    }
+    let lane = index - floor(index / 4.0) * 4.0
+    if lane == 0.0 {
+        return set.x
+    }
+    if lane == 1.0 {
+        return set.y
+    }
+    if lane == 2.0 {
+        return set.z
+    }
+    return set.w
+}
+
+shader Blur {
+    group Filter {
+        uniform globals: BlurGlobals
+        texture source: Texture2d
+        sampler sourceSampler: Sampler
+    }
+
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        function entry(input: VertexIn) -> VertexOut {
+            let corner = input.vid
+            if input.vid == UInt(3) {
+                corner = UInt(0)
+            }
+            if input.vid > UInt(3) {
+                corner = input.vid - UInt(2)
+            }
+            let x = -1.0
+            if corner == UInt(1) || corner == UInt(2) {
+                x = 1.0
+            }
+            let y = 1.0
+            if corner > UInt(1) {
+                y = -1.0
+            }
+            let out: VertexOut
+            out.clip_position = Float4(x, y, 0.0, 1.0)
+            return out
+        }
+    }
+
+    fragment {
+        input VertexOut
+        output FragmentOut
+
+        function read(point: Float2) -> Float4 {
+            let clamped = clamp(point, globals.low, globals.high)
+            return sample(source, sourceSampler, clamped * globals.sourceScale)
+        }
+
+        function entry(input: VertexOut) -> FragmentOut {
+            let point = input.clip_position.xy * globals.scale + globals.offset
+            let result: FragmentOut
+            if globals.mode == 0.0 {
+                result.color = Half4(read(point))
+                return result
+            }
+            let total = Float4(0.0, 0.0, 0.0, 0.0)
+            let index = 0.0
+            if globals.mode == 2.0 {
+                while index < 4.0 {
+                    total = total + read(point + tapOffset(globals, index)) * tapWeight(globals, index)
+                    index = index + 1.0
+                }
+                result.color = Half4(total)
+                return result
+            }
+            while index < globals.count {
+                let delta = tapOffset(globals, index)
+                let weight = tapWeight(globals, index)
+                total = total + read(point - delta) * weight
+                total = total + read(point + delta) * weight
+                index = index + 1.0
+            }
+            if globals.flags.x == 1.0 {
+                // An opaque blur's last pass: unpremultiplied, alpha 1.
+                let alpha = max(total.w, 0.0050010681)
+                total = Float4(total.x / alpha, total.y / alpha, total.z / alpha, 1.0)
+            }
+            result.color = Half4(total)
+            return result
+        }
+    }
+}

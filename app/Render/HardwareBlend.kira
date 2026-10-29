@@ -1,0 +1,73 @@
+import Foundation
+import Ember
+
+// How a blend mode reaches the GPU: RB::(anonymous)::set_blend_state. Copy
+// writes the fragment through; the Porter-Duff modes and RenderBox's linear
+// ones are fixed-function factors; every other mode reads the destination in
+// the shader.
+public enum HardwareBlend {
+    WriteThrough
+    Function(BlendFunction)
+    Shader
+}
+
+function blendOf(source: BlendFactor, destination: BlendFactor) -> BlendFunction {
+    return uniformBlend(BlendComponent { source: source, destination: destination })
+}
+
+// A blend whose color and alpha differ only in their destination factor.
+function blendSplit(
+    source: BlendFactor,
+    colorDestination: BlendFactor,
+    alphaDestination: BlendFactor
+) -> BlendFunction {
+    return BlendFunction {
+        color: BlendComponent { source: source, destination: colorDestination },
+        alpha: BlendComponent { source: source, destination: alphaDestination }
+    }
+}
+
+function blendOperation(operation: BlendOperation) -> BlendFunction {
+    return uniformBlend(BlendComponent { operation: operation, source: .One, destination: .One })
+}
+
+// The modes the GPU blends by factors alone: the table at 0x1b328a520, by
+// the RBBlendMode each row serves.
+function fixedFunctionBlends() -> [(BlendMode, BlendFunction)] {
+    let exclusion = BlendFunction {
+        color: BlendComponent { source: .OneMinusDestination, destination: .OneMinusSource },
+        alpha: BlendComponent { source: .One, destination: .OneMinusSourceAlpha }
+    }
+    return [
+        (.Clear, blendOf(.Zero, .Zero)),
+        (.Normal, blendOf(.One, .OneMinusSourceAlpha)),
+        (.SourceIn, blendOf(.DestinationAlpha, .Zero)),
+        (.SourceOut, blendOf(.OneMinusDestinationAlpha, .Zero)),
+        (.SourceAtop, blendOf(.DestinationAlpha, .OneMinusSourceAlpha)),
+        (.DestinationOver, blendOf(.OneMinusDestinationAlpha, .One)),
+        (.DestinationIn, blendOf(.Zero, .SourceAlpha)),
+        (.DestinationOut, blendOf(.Zero, .OneMinusSourceAlpha)),
+        (.DestinationAtop, blendOf(.OneMinusDestinationAlpha, .SourceAlpha)),
+        (.Xor, blendOf(.OneMinusDestinationAlpha, .OneMinusSourceAlpha)),
+        (.Add, blendOf(.One, .One)),
+        (.Screen, blendSplit(.One, .OneMinusSource, .OneMinusSourceAlpha)),
+        (.LinearDodge, blendSplit(.One, .One, .OneMinusSourceAlpha)),
+        (.Exclusion, exclusion),
+        (.Maximum, blendOperation(.Max)),
+        (.Minimum, blendOperation(.Min)),
+        (.SubtractSource, blendOperation(.ReverseSubtract)),
+        (.SubtractDestination, blendOperation(.Subtract))
+    ]
+}
+
+public function hardwareBlend(mode: BlendMode) -> HardwareBlend {
+    if mode == .Copy {
+        return .WriteThrough
+    }
+    for (served, blend) in fixedFunctionBlends() {
+        if served == mode {
+            return .Function(blend)
+        }
+    }
+    return .Shader
+}

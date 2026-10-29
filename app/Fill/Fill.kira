@@ -1,0 +1,78 @@
+import Foundation
+
+public struct ColorFill {
+    let color: RGBAColor
+    let colorSpace: ColorSpace
+}
+
+public struct ImageFill {
+    let image: Image
+    let transform: AffineTransform
+    let interpolation: InterpolationMode
+    let tint: RGBAColor?
+    let colorSpace: ColorSpace
+}
+
+public struct ShaderFill {
+    let shader: Shader
+    let bounds: Rect
+}
+
+// RBFillData: what fills a shape's coverage.
+public enum FillData {
+    Color(ColorFill)
+    Gradient(Gradient)
+    Image(ImageFill)
+    Shader(ShaderFill)
+    MeshGradient(MeshGradient)
+}
+
+// RBFill. A fresh fill is opaque black, as RenderBox's.
+public class Fill {
+    var data: FillData = .Color(
+        ColorFill { color: RGBAColor { r: 0, g: 0, b: 0, a: 1 }, colorSpace: .StandardRgb }
+    )
+    var headroom: Number = 0
+}
+
+extend Fill {
+    function setColor(color: RGBAColor, colorSpace: ColorSpace) {
+        data = .Color(ColorFill { color: color, colorSpace: colorSpace })
+    }
+
+    // set_gradient_color: stops that are all one colour fill as that colour.
+    function setGradient(gradient: Gradient) {
+        if gradient.stops.count > 0 && allStopsMatch(gradient.stops) {
+            setColor(copy gradient.stops[0].color, gradient.colorSpace)
+            return
+        }
+        data = .Gradient(gradient)
+    }
+
+    function setImage(fill: ImageFill) {
+        data = .Image(fill)
+    }
+
+    function setShader(shader: Shader, bounds: Rect) {
+        data = .Shader(ShaderFill { shader: shader, bounds: bounds })
+    }
+
+    function setMeshGradient(mesh: MeshGradient) {
+        data = .MeshGradient(mesh)
+    }
+
+    function setHeadroom(value: Number) {
+        headroom = value
+    }
+}
+
+function allStopsMatch(stops: borrow [GradientStop]) -> Bool {
+    let first = stops[0].color
+    for stop in stops {
+        let color = stop.color
+        if color.r != first.r || color.g != first.g || color.b != first.b || color.a != first.a {
+            return false
+        }
+    }
+    return true
+}

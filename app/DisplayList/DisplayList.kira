@@ -1,0 +1,329 @@
+import Foundation
+
+// A layer begun and not yet drawn, with how many saved states were open when
+// it began, so ending it restores to there.
+struct OpenLayer {
+    var contents: LayerContents
+    let savedStates: UNumber
+}
+
+public enum DisplayListFailure {
+    // drawLayer or clipLayer without a beginLayer to end.
+    NoOpenLayer
+    // restore without a save.
+    NoSavedState
+}
+
+// RBDisplayList: records drawing into layers of items. Saving pushes a copy
+// of the state; transforms, clips and styles change only the state on top.
+public class DisplayList {
+    var state: DrawingState = DrawingState()
+    var savedStates: [DrawingState] = []
+    var root: LayerContents = LayerContents()
+    var openLayers: [OpenLayer] = []
+}
+
+extend DisplayList {
+    function save() {
+        savedStates.append(copy state)
+    }
+
+    function restore() -> Result<Void, DisplayListFailure> {
+        let saved = try savedStates.popLast() otherwise return .Error(.NoSavedState)
+        state = saved
+        return .Ok
+    }
+
+    function translateBy(x: Number, y: Number) {
+        state.transform = state.transform.translatedBy(x, y)
+    }
+
+    function scaleBy(x: Number, y: Number) {
+        state.transform = state.transform.scaledBy(x, y)
+    }
+
+    function rotateBy(radians: Number) {
+        state.transform = state.transform.rotatedBy(radians)
+    }
+
+    function concat(transform: borrow AffineTransform) {
+        state.transform = transform.concatenating(state.transform)
+    }
+
+    function setTransform(transform: AffineTransform) {
+        state.transform = transform
+    }
+
+    // Brightness above standard white the content may reach, for the extended
+    // range. RenderBox ignores a value that is not positive.
+    function addContentHeadroom(headroom: Number) {
+        if headroom > 0 {
+            state.contentHeadroom = max(state.contentHeadroom, headroom)
+        }
+    }
+
+    function addStyle(style: Style) {
+        state.styles.append(style)
+        state.styleClipCounts.append(state.clips.count)
+    }
+
+    // -[RBDisplayList addColorMatrixFilterWithArray:flags:]: the twenty
+    // floats it reads, row by row, and the flags' low three bits.
+    function addColorMatrixFilter(matrix: [Number], flags: ColorFilterFlags) {
+        if matrix.count != ColorMatrices.entries {
+            return
+        }
+        let style = ColorMatrixStyle { matrix: matrix, flags: ColorFilterFlags(flags.raw & 7) }
+        addStyle(.ColorMatrix(style))
+    }
+
+    // RBDisplayListColorClamp, as add_style takes it: the lowest and highest
+    // colour, and the space they are in.
+    function addColorClampFilter(min: RGBAColor, max: RGBAColor, colorSpace: ColorSpace) {
+        let style = ColorClampStyle { min: min, max: max, colorSpace: colorSpace }
+        addStyle(.ColorClamp(style))
+    }
+
+    // RBDisplayListGradientMap, as add_style takes it: State::add_gradient_map
+    // builds the alpha gradient from the stops, space and flags.
+    function addGradientMap(
+        component: PixelComponent,
+        low: Number,
+        high: Number,
+        stops: [GradientStop],
+        colorSpace: ColorSpace,
+        edgeMode: GradientEdgeMode,
+        interpolation: GradientInterpolation,
+        space: ColorInterpolation
+    ) {
+        let gradient = Gradient {
+            geometry: .Alpha,
+            stops: stops,
+            colorSpace: colorSpace,
+            edgeMode: edgeMode,
+            interpolation: interpolation,
+            space: space
+        }
+        let style = GradientMapStyle {
+            component: component,
+            low: low,
+            high: high,
+            gradient: gradient
+        }
+        addStyle(.GradientMap(style))
+    }
+
+    // RBDisplayListDistanceFilter, as add_style takes it: a blur radius drops
+    // the smoothing level. Distance::apply_transform scales the lengths into
+    // device pixels by the transform's scale.
+    function addDistanceFilter(
+        outside: Number,
+        inside: Number,
+        scale: Number,
+        smoothingRadius: Number,
+        format: DistanceFormat,
+        smoothing: DistanceSmoothing,
+        edges: DistanceEdgeDetection
+    ) {
+        let factor = state.transform.lengthScale()
+        let style = DistanceStyle {
+            outside: outside * factor,
+            inside: inside * factor,
+            scale: scale,
+            smoothingRadius: smoothingRadius >= 0 ? smoothingRadius * factor : smoothingRadius,
+            format: format,
+            smoothing: smoothingRadius >= 0 ? .Default : smoothing,
+            edges: edges
+        }
+        addStyle(.Distance(style))
+    }
+
+    // RBDrawingStateAddBlurFilter: the radius is the Gaussian's standard
+    // deviation, which GaussianBlur::apply_transform scales by the state's
+    // transform along each axis.
+    function addBlurFilter(radius: Number, flags: BlurFlags) {
+        let (scaleX, scaleY) = state.transform.axisScales()
+        let style = BlurStyle {
+            radius: Vector2 { x: radius * scaleX, y: radius * scaleY },
+            flags: flags
+        }
+        addStyle(.Blur(style))
+    }
+
+    // add_style(RBDisplayListShadow) then State::add_shadow: the flags past
+    // bit 5 are dropped.
+    function addShadow(
+        radius: Number,
+        midpoint: Number,
+        offset: Size,
+        fill: ColorFill,
+        headroom: Number,
+        blendMode: BlendMode,
+        flags: ShadowFlags
+    ) {
+        let style = ShadowStyle {
+            radius: radius,
+            midpoint: midpoint,
+            offset: offset,
+            color: copy fill.color,
+            colorSpace: fill.colorSpace,
+            headroom: headroom,
+            blendMode: blendMode,
+            flags: ShadowFlags(flags.raw & 63),
+            transform: copy state.transform
+        }
+        addStyle(.Shadow(style))
+    }
+
+    // add_color_multiply_style: ColorMultiply::color_matrix, a matrix that
+    // scales each channel by the colour's, the colour's own channels
+    // premultiplied first when the flags say.
+    function addColorMultiplyFilter(color: RGBAColor, flags: ColorFilterFlags) {
+        let alpha = flags.has(ColorFilterFlags.premultiplied) ? color.a : 1
+        let matrix: [Number] = [
+            color.r * alpha, 0, 0, 0, 0, 0, color.g * alpha, 0, 0, 0, 0, 0, color.b * alpha, 0, 0,
+            0, 0, 0, color.a, 0
+        ]
+        addColorMatrixFilter(move matrix, flags)
+    }
+
+    // add_style(RBDisplayListColorThreshold) then
+    // State::add_color_threshold: `component` between `low` and `high`, or
+    // above `low` with no high end, painted `color`.
+    function addColorThreshold(
+        component: PixelComponent,
+        low: Number,
+        high: Number?,
+        color: RGBAColor
+    ) {
+        let style = AlphaThresholdStyle { component: component, low: low, high: high, color: color }
+        addStyle(.AlphaThreshold(style))
+    }
+
+    // RB::XML::DisplayList::add_shader_filter's call, State::add_custom_effect:
+    // `shader` over the layer, its output reaching `border` past it.
+    function addShaderFilter(shader: Shader, border: FilterBorder, flags: ShaderFilterFlags) {
+        let style = ShaderFilterStyle {
+            shader: shader,
+            border: border,
+            flags: flags,
+            transform: copy state.transform
+        }
+        addStyle(.ShaderFilter(style))
+    }
+
+    function drawShape(
+        shape: borrow Shape,
+        fill: borrow Fill,
+        alpha: Number,
+        blendMode: BlendMode
+    ) {
+        let item = ShapeItem {
+            shape: shape.snapshot(),
+            fill: copy fill.data,
+            headroom: fill.headroom,
+            alpha: alpha,
+            blendMode: blendMode,
+            state: copy state
+        }
+        record(.Shape(item))
+    }
+
+    function clipShape(shape: borrow Shape, alpha: Number, mode: ClipMode) {
+        let clip = ShapeClip {
+            shape: shape.snapshot(),
+            transform: copy state.transform,
+            alpha: alpha,
+            mode: mode
+        }
+        state.clips.append(.Shape(clip))
+    }
+
+    function beginLayer(flags: LayerFlags) {
+        let layer = OpenLayer {
+            contents: LayerContents { flags: normalizedLayerFlags(flags) },
+            savedStates: savedStates.count
+        }
+        openLayers.append(layer)
+        save()
+        // The state's clips and styles clip and filter the layer as it is
+        // drawn or clipped to, once, not each item inside it again.
+        state.clips = []
+        state.styles = []
+        state.styleClipCounts = []
+    }
+
+    function drawLayer(alpha: Number, blendMode: BlendMode) -> Result<Void, DisplayListFailure> {
+        let contents = try endLayer() otherwise return .Error(.NoOpenLayer)
+        let item = LayerItem {
+            contents: contents,
+            alpha: alpha,
+            blendMode: blendMode,
+            state: copy state
+        }
+        record(.Layer(item))
+        return .Ok
+    }
+
+    function clipLayer(alpha: Number, mode: ClipMode) -> Result<Void, DisplayListFailure> {
+        let contents = try endLayer() otherwise return .Error(.NoOpenLayer)
+        state.clips.append(.Layer(LayerClip { contents: contents, alpha: alpha, mode: mode }))
+        return .Ok
+    }
+
+    // Builder::end_layer and restore: the layer's items, with the state as it
+    // was when the layer began.
+    function endLayer() -> LayerContents? {
+        let layer = try openLayers.popLast() otherwise return .None
+        for _ in layer.savedStates..savedStates.count {
+            state = try savedStates.popLast() otherwise return .None
+        }
+        return .Some(layer.contents)
+    }
+
+    function record(item: Item) {
+        if openLayers.count == 0 {
+            root.items.append(move item)
+            return
+        }
+        let last = openLayers.count - 1
+        openLayers[last].contents.items.append(move item)
+    }
+
+    // The contents recorded so far, as RBDisplayList's moveContents hands them
+    // over, leaving the list empty.
+    function moveContents() -> LayerContents {
+        let contents = root
+        root = LayerContents()
+        state = DrawingState()
+        savedStates = []
+        openLayers = []
+        return contents
+    }
+}
+
+// -[RBDisplayList beginLayerWithFlags:]: linear wins over non-linear, and a
+// metadata-only layer is also ignored by needs-background.
+function normalizedLayerFlags(flags: LayerFlags) -> LayerFlags {
+    var result = flags.without(LayerFlags.ignoredByNeedsBackground)
+    result = flags.has(LayerFlags.linear) ? result.without(LayerFlags.nonLinear) : result
+    let ignored = flags.has(LayerFlags.onlyMetadata) || flags.has(
+        LayerFlags.ignoredByNeedsBackground
+    )
+    return ignored ? result.union(LayerFlags.ignoredByNeedsBackground) : result
+}
+
+extend Shape {
+    function snapshot() -> ShapeSnapshot {
+        return ShapeSnapshot {
+            data: simplifiedShape(copy data, renderingMode),
+            fillRule: fillRule,
+            renderingMode: renderingMode,
+            renderingModeArgument: renderingModeArgument
+        }
+    }
+}
+
+namespace ColorMatrices {
+    let entries: Number = 20
+}

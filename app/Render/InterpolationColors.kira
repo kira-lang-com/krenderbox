@@ -1,0 +1,94 @@
+import Foundation
+
+// A fill's colour from its space into the one its interpolation runs in,
+// then into OKLab's cube roots for a perceptual one, then premultiplied by
+// its alpha times the opacity, every step in halves: the mesh's
+// ColorConversion and the gradient's stop colours alike.
+struct InterpolationConversion {
+    let conversion: ColorConversion
+    let oklab: Bool
+    let opacity: Number
+}
+
+namespace Oklab {
+    // Color::convert_to_oklab's linear sRGB to LMS, row by row, and the
+    // power it then raises each to.
+    let toLms: [Number] = [
+        0.4122214615, 0.5363325477, 0.0514459945,
+        0.2119034976, 0.6806995273, 0.1073969603,
+        0.0883024633, 0.2817188501, 0.6299787163
+    ]
+    let power: Number = 0.3333333433
+}
+
+// The space colours run in: the pass's for the device, its primaries
+// linear for a linear or perceptual interpolation, its primaries with the
+// sRGB curve for a non-linear one.
+function interpolationSpace(interpolation: ColorInterpolation, pass: Number) -> Number {
+    return match interpolation {
+        Device -> pass
+        Linear, Perceptual -> pass & 0xf
+        NonLinear -> (pass & 0xf) | 0x10
+    }
+}
+
+function interpolationConversion(
+    session: borrow RenderSession,
+    space: ColorSpace,
+    interpolation: ColorInterpolation,
+    opacity: Number
+) -> Result<InterpolationConversion, RenderFailure> {
+    let source = try spaceCode(space) otherwise session.colorSpace
+    let target = interpolationSpace(interpolation, session.colorSpace)
+    let conversion = try colorConversion(source, 0, target, 0)
+    return .Ok(
+        InterpolationConversion {
+            conversion: conversion,
+            oklab: interpolation == .Perceptual,
+            opacity: opacity
+        }
+    )
+}
+
+extend InterpolationConversion {
+    function converted(color: borrow RGBAColor) -> RGBAColor {
+        return prepared(spaced(color))
+    }
+
+    // The colour in the interpolation's space.
+    function spaced(color: borrow RGBAColor) -> RGBAColor {
+        return conversion.converted(halfColor(color))
+    }
+
+    // A colour already in the interpolation's space, in OKLab when it runs
+    // there, premultiplied.
+    function prepared(color: borrow RGBAColor) -> RGBAColor {
+        var result = copy color
+        if oklab {
+            result = oklabRoots(result)
+        }
+        let alpha = halfRounded(opacity * result.a)
+        return RGBAColor {
+            r: halfRounded(result.r * alpha),
+            g: halfRounded(result.g * alpha),
+            b: halfRounded(result.b * alpha),
+            a: alpha
+        }
+    }
+}
+
+// Color::convert_to_oklab: the colour's LMS, each the signed cube root of
+// its magnitude.
+function oklabRoots(color: borrow RGBAColor) -> RGBAColor {
+    let rgb = [color.r, color.g, color.b]
+    var roots: [Number] = []
+    for row in 0..3 {
+        var lms: Number = 0
+        for column in 0..3 {
+            lms += Oklab.toLms[row * 3 + column] * rgb[column]
+        }
+        let root = pow(abs(lms), Oklab.power)
+        roots.append(halfRounded(lms < 0 ? -root : root))
+    }
+    return RGBAColor { r: roots[0], g: roots[1], b: roots[2], a: color.a }
+}

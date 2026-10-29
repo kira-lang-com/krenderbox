@@ -1,0 +1,166 @@
+import Foundation
+import Ember
+
+// RB::Path::Paint::fill's plane: AccumulatorGlobals in `Shaders/Accumulator.ksl`.
+// `plane` is in device pixels until it is packed.
+struct AccumulatorGlobals {
+    var plane: Rect = Rect()
+    var evenOdd: Bool = false
+    // accumulator_shape's first mode: the accumulator holds coverage, not
+    // a winding.
+    var rawCoverage: Bool = false
+    // accumulator_shape's distance mode: the rendering mode whose shape the
+    // accumulator's winding and nearness make, or none.
+    var distance: RenderingMode? = .None
+    var color: RGBAColor = RGBAColor()
+    var fill: AffineTransform = AffineTransform()
+    var textured: Bool = false
+    var masked: Bool = false
+    var conversion: [Number] = ImageConversion.none
+}
+
+extend AccumulatorGlobals {
+    // The uniform's floats, in the shader's packing.
+    function floats(width: Number, height: Number) -> [Number] {
+        let left = plane.minX() * 2 / width - 1
+        let right = plane.maxX() * 2 / width - 1
+        let top = 1 - plane.minY() * 2 / height
+        let bottom = 1 - plane.maxY() * 2 / height
+        var floats = [
+            left, top, right, bottom,
+            0, evenOdd ? 1 : 0, rawCoverage ? 1 : 0, distanceShape(distance),
+            color.r, color.g, color.b, color.a,
+            fill.a, fill.b, fill.c, fill.d,
+            fill.tx, fill.ty, textured ? 1 : 0, masked ? 1 : 0,
+            1 / width, 1 / height, 1 / width, 1 / height
+        ]
+        floats.appendAll(copy conversion)
+        return floats
+    }
+}
+
+// AccumulatorGlobals' `distance`: path_distance's shape for a distance
+// rendering mode.
+function distanceShape(mode: borrow RenderingMode?) -> Number {
+    return match mode {
+        Some(shaped) -> match shaped {
+            InnerDistance -> 1
+            OuterDistance -> 2
+            SignedDistance -> 3
+            Antialiased, Aliased -> 0
+        }
+        None -> 0
+    }
+}
+
+// The plane reading `accumulator` and painting `paint` through `mask`, drawn
+// through `blend`.
+function accumulatorDraw(
+    session: borrow mut RenderSession,
+    globals: AccumulatorGlobals,
+    accumulator: GraphicsTexture,
+    paint: Paint,
+    mask: GraphicsTexture?,
+    blend: BlendMode
+) -> Result<RecordedDraw?, RenderFailure> {
+    var painting = move globals
+    let fillSampler = paintSampler(paint, session.sampler)
+    let fill = paintedPlane(painting, paint, session.white)
+    let maskTexture = match mask {
+        Some(texture) -> {
+            painting.masked = true
+            texture
+        }
+        None -> copy session.white
+    }
+    let pipeline = match accumulatorPipeline(session, blend) {
+        Ok(pipeline) -> pipeline
+        Error(failure) -> return .Error(failure)
+    }
+    let floats = painting.floats(Number(session.width), Number(session.height))
+    let bound = boundPlane(session, move floats, accumulator, fill, fillSampler, maskTexture)
+    return match bound {
+        Ok(bindGroup) -> .Ok(
+            .Some(
+                RecordedDraw {
+                    pipeline: pipeline,
+                    bindGroup: bindGroup,
+                    vertexCount: PathDrawing.planeVertices
+                }
+            )
+        )
+        Error(failure) -> .Error(failure)
+    }
+}
+
+// Sets the plane's paint and answers the texture the fill samples.
+function paintedPlane(
+    globals: borrow mut AccumulatorGlobals,
+    paint: borrow Paint,
+    white: borrow GraphicsTexture
+) -> GraphicsTexture {
+    match paint {
+        Solid(color) -> {
+            globals.color = copy color
+            return copy white
+        }
+        Textured(textured) -> {
+            globals.color = copy textured.color
+            globals.fill = copy textured.fromDevice
+            globals.textured = true
+            globals.conversion = copy textured.conversion
+            return copy textured.texture
+        }
+    }
+}
+
+function boundPlane(
+    session: borrow mut RenderSession,
+    floats: [Number],
+    accumulator: borrow GraphicsTexture,
+    fill: borrow GraphicsTexture,
+    fillSampler: borrow GraphicsSampler,
+    mask: borrow GraphicsTexture
+) -> Result<BindGroup, RenderFailure> {
+    let uniform = match sessionUniform(
+        session,
+        "renderbox-accumulator-globals",
+        PathDrawing.paintGlobalsFloatCount,
+        move floats
+    ) {
+        Ok(uniform) -> uniform
+        Error(failure) -> return .Error(failure)
+    }
+    let graphics = session.device.graphics()
+    let bindGroup = match graphics.beginBindGroup("renderbox-accumulator") {
+        Ok(bindGroup) -> bindGroup
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    graphics.bindGroupAddUniform(bindGroup, PathDrawing.paintGlobalsBinding, uniform)
+    graphics.bindGroupAddTexture(bindGroup, PathDrawing.accumulatorBinding, accumulator)
+    graphics.bindGroupAddSampler(bindGroup, PathDrawing.accumulatorSamplerBinding, session.nearest)
+    graphics.bindGroupAddTexture(bindGroup, PathDrawing.fillBinding, fill)
+    graphics.bindGroupAddSampler(bindGroup, PathDrawing.fillSamplerBinding, fillSampler)
+    graphics.bindGroupAddTexture(bindGroup, PathDrawing.maskBinding, mask)
+    graphics.bindGroupAddSampler(bindGroup, PathDrawing.maskSamplerBinding, session.sampler)
+    session.bindGroups.append(copy bindGroup)
+    return .Ok(bindGroup)
+}
+
+// The plane's pipeline through `blend`'s fixed-function state.
+function accumulatorPipeline(
+    session: borrow mut RenderSession,
+    blend: BlendMode
+) -> Result<RenderPipeline, RenderFailure> {
+    let state = match hardwareBlend(blend) {
+        WriteThrough -> BlendState { enabled: false }
+        Function(blendFunction) -> BlendState { enabled: true, custom: .Some(blendFunction) }
+        Shader -> return .Error(.ShaderBlend(blend))
+    }
+    return namedPipeline(
+        session,
+        "\(PathDrawing.accumulatorPipeline)-\(blend)",
+        ksl!("Shaders/Accumulator.ksl"),
+        ColorTargetDescriptor { format: session.format, blend: state }
+    )
+}

@@ -1,0 +1,4 @@
+// RenderBox's test suite. The runner expands into this file, so what it calls
+// has to be in scope here.
+import Foundation
+import RenderBox

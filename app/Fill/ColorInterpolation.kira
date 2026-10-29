@@ -1,0 +1,12 @@
+import Foundation
+
+// RB::ColorInterpolation: the space a fill's colours run in between the
+// ones it was given. The device's is the pass's; a linear or perceptual one
+// runs in the pass's primaries without a transfer curve, the perceptual one
+// in OKLab's cube roots; a non-linear one runs with the sRGB curve.
+public enum ColorInterpolation: UN8 {
+    Device = 0
+    Linear = 1
+    NonLinear = 2
+    Perceptual = 3
+}

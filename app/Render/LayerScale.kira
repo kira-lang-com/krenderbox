@@ -1,0 +1,304 @@
+import Foundation
+import Ember
+
+namespace LayerScaling {
+    // GaussianBlur::layer_scale: the deviation a layer blurred last is drawn
+    // small enough to need, at the default quality.
+    let blurDeviation: Number = 5.25
+    // Layer::apply_transform doubles the scale back up at most three times,
+    // while the doubled scale stays within what the contents need.
+    let doublings: Number = 3
+    // RB::Fill::Image::min_scale's table by interpolation, from 1: linear and
+    // the low and high qualities keep half the scale; the others none.
+    let imageScales: [Number] = [0.5, 0, 0, 0.5, 0, 0, 0.5, 0, 0]
+}
+
+// Builder::apply_filter_ for a layer whose innermost style is a blur: the
+// layer is drawn at the scale that leaves the deviation 5.25 pixels, doubled
+// while its contents need more, and never above the device's. One otherwise.
+function blurLayerScale(state: borrow DrawingState, contents: borrow LayerContents) -> Number {
+    if state.styles.count == 0 {
+        return 1
+    }
+    let deviation = match state.styles[state.styles.count - 1] {
+        Blur(blur) -> blurScaled(blur.flags) ? max(blur.radius.x, blur.radius.y) : 0
+        Shadow(shadow) -> 0
+        ColorMatrix(matrix) -> 0
+        ColorClamp(clamp) -> 0
+        GradientMap(map) -> 0
+        Distance(distance) -> 0
+        ShaderFilter(filter) -> 0
+        AlphaThreshold(threshold) -> 0
+    }
+    if deviation <= 0 {
+        return 1
+    }
+    let needed = contentsMinScale(contents)
+    var scale = min(LayerScaling.blurDeviation / deviation, 1)
+    var doubled: Number = 0
+    while scale * 2 <= needed && doubled < LayerScaling.doublings {
+        scale *= 2
+        doubled += 1
+    }
+    return min(scale, 1)
+}
+
+// Layer::min_scale: the most any item or its clips need, a filled image by
+// its interpolation, and a colour filter the full scale. Path coverage's own need is not ported, and counts nothing.
+function contentsMinScale(contents: borrow LayerContents) -> Number {
+    var needed: Number = 0
+    for item in contents.items {
+        let (scale, state) = match item {
+            Shape(shape) -> (fillMinScale(shape.fill), copy shape.state)
+            Layer(layer) -> (contentsMinScale(layer.contents), copy layer.state)
+        }
+        needed = max(needed, scale)
+        for style in state.styles {
+            needed = max(needed, styleMinScale(style))
+        }
+        let clips = state.clips
+        for clip in clips {
+            match clip {
+                Shape(shape) -> {}
+                Layer(layer) -> needed = max(needed, contentsMinScale(layer.contents))
+            }
+        }
+    }
+    return needed
+}
+
+// The Builder lowers a colour filter on an item into a BackdropFilterItem
+// after it, whose min_scale is one: the alpha threshold, colour matrix and
+// clamp, and a custom shader. Blurs, distances, shadows and gradient maps
+// lower otherwise and need nothing.
+function styleMinScale(style: borrow Style) -> Number {
+    return match style {
+        ColorMatrix(matrix) -> 1
+        ColorClamp(clamp) -> 1
+        AlphaThreshold(threshold) -> 1
+        ShaderFilter(filter) -> 1
+        GradientMap(map) -> 0
+        Distance(distance) -> 0
+        Shadow(shadow) -> 0
+        Blur(blur) -> 0
+    }
+}
+
+function fillMinScale(fill: borrow FillData) -> Number {
+    return match fill {
+        Image(image) -> {
+            let index = Number(code(image.interpolation))
+            return index >= 1 && index <= LayerScaling.imageScales.count
+            ? LayerScaling.imageScales[index - 1]
+            : 1
+        }
+        Color(color) -> 0
+        Gradient(gradient) -> 0
+        Shader(shader) -> 0
+        MeshGradient(mesh) -> 0
+    }
+}
+
+// `contents` as drawn into a layer `scale` times the device's size: every
+// transform, clip and blur scaled. A style whose drawing depends on the scale
+// in a way not ported leaves the layer at the device's.
+function scaledContents(contents: borrow LayerContents, scale: Number) -> LayerContents? {
+    return transformedContents(contents, AffineTransform { a: scale, d: scale }, scale)
+}
+
+// `contents` with `toLayer` after every transform and clip, and blurs scaled
+// by `scale`, the lengths `toLayer` scales by.
+function transformedContents(
+    contents: borrow LayerContents,
+    toLayer: borrow AffineTransform,
+    scale: Number
+) -> LayerContents? {
+    var items: [Item] = []
+    for item in contents.items {
+        items.append(try transformedItem(item, toLayer, scale) otherwise return .None)
+    }
+    return .Some(LayerContents { flags: contents.flags, items: items })
+}
+
+// One item with `toLayer` after its transform and clips, a layer's contents
+// too; none when a blur cannot be scaled.
+function transformedItem(
+    item: borrow Item,
+    toLayer: borrow AffineTransform,
+    scale: Number
+) -> Item? {
+    match item {
+        Shape(shape) -> {
+            let state = try transformedState(shape.state, toLayer, scale) otherwise return .None
+            let moved = ShapeItem {
+                shape: copy shape.shape,
+                fill: copy shape.fill,
+                headroom: shape.headroom,
+                alpha: shape.alpha,
+                blendMode: shape.blendMode,
+                state: state
+            }
+            return .Some(.Shape(moved))
+        }
+        Layer(layer) -> {
+            let state = try transformedState(layer.state, toLayer, scale) otherwise return .None
+            let inner = try transformedContents(
+                layer.contents,
+                toLayer,
+                scale
+            ) otherwise return .None
+            let moved = LayerItem {
+                contents: inner,
+                alpha: layer.alpha,
+                blendMode: layer.blendMode,
+                state: state
+            }
+            return .Some(.Layer(moved))
+        }
+    }
+}
+
+function transformedState(
+    state: borrow DrawingState,
+    toLayer: borrow AffineTransform,
+    scale: Number
+) -> DrawingState? {
+    let clips = try transformedClips(state.clips, toLayer, scale) otherwise return .None
+    var styles: [Style] = []
+    for style in state.styles {
+        styles.append(try scaledStyle(style, scale) otherwise return .None)
+    }
+    return .Some(
+        DrawingState {
+            transform: state.transform.concatenating(toLayer),
+            clips: clips,
+            styles: styles,
+            styleClipCounts: copy state.styleClipCounts,
+            contentHeadroom: state.contentHeadroom
+        }
+    )
+}
+
+function scaledClips(clips: borrow [Clip], scale: Number) -> [Clip]? {
+    return transformedClips(clips, AffineTransform { a: scale, d: scale }, scale)
+}
+
+function transformedClips(
+    clips: borrow [Clip],
+    toLayer: borrow AffineTransform,
+    scale: Number
+) -> [Clip]? {
+    var scaled: [Clip] = []
+    for clip in clips {
+        match clip {
+            Shape(shape) -> scaled.append(
+                .Shape(
+                    ShapeClip {
+                        shape: copy shape.shape,
+                        transform: shape.transform.concatenating(toLayer),
+                        alpha: shape.alpha,
+                        mode: shape.mode
+                    }
+                )
+            )
+            Layer(layer) -> {
+                let inner = try transformedContents(
+                    layer.contents,
+                    toLayer,
+                    scale
+                ) otherwise return .None
+                scaled.append(
+                    .Layer(LayerClip { contents: inner, alpha: layer.alpha, mode: layer.mode })
+                )
+            }
+        }
+    }
+    return .Some(scaled)
+}
+
+// A style as GaussianBlur::apply_transform and the colour filters take the
+// layer's scale: a blur's deviation scales, a colour filter's nothing.
+function scaledStyle(style: borrow Style, scale: Number) -> Style? {
+    return match style {
+        Blur(blur) -> .Some(
+            .Blur(
+                BlurStyle {
+                    radius: Vector2 { x: blur.radius.x * scale, y: blur.radius.y * scale },
+                    flags: blur.flags
+                }
+            )
+        )
+        ColorMatrix(matrix) -> .Some(copy style)
+        ColorClamp(clamp) -> .Some(copy style)
+        GradientMap(map) -> .Some(copy style)
+        AlphaThreshold(threshold) -> .Some(copy style)
+        Shadow(shadow) -> .None
+        Distance(distance) -> .None
+        ShaderFilter(filter) -> .None
+    }
+}
+
+// The layer drawn through `clips`, those added after its styles, and blurred at
+// `scale` in a target of its own, the device's size times the scale rounded
+// up, then read back at the device's size: each device pixel reads where it
+// falls in the small layer, between its four nearest pixels.
+function reducedBlurredSurface(
+    session: borrow mut RenderSession,
+    contents: borrow LayerContents,
+    state: borrow DrawingState,
+    clips: borrow [Clip],
+    scale: Number
+) -> Result<GraphicsTexture?, RenderFailure> {
+    let scaled = try scaledContents(contents, scale) otherwise return .Ok(.None)
+    let inner = try scaledClips(clips, scale) otherwise return .Ok(.None)
+    let blur = try scaledStyle(state.styles[state.styles.count - 1], scale) otherwise return .Ok(
+        .None
+    )
+    let width = session.width
+    let height = session.height
+    session.width = UN32(ceil(Number(width) * scale))
+    session.height = UN32(ceil(Number(height) * scale))
+    let reduced = reducedBlur(session, scaled, inner, blur)
+    let (small, smallWidth, smallHeight) = (reduced, session.width, session.height)
+    session.width = width
+    session.height = height
+    let texture = try small
+    let target = try surface(session, "renderbox-reduced-layer")
+    let fromDevice = AffineTransform {
+        a: scale / Number(smallWidth),
+        d: scale / Number(smallHeight)
+    }
+    let paint = Paint.Textured(
+        TexturePaint {
+            texture: texture,
+            fromDevice: fromDevice,
+            color: copy Surfaces.unclipped,
+            sampler: copy session.sampler
+        }
+    )
+    let draw = try wholeTargetDraw(session, move paint, .None, .Normal)
+    var draws: [RecordedDraw] = []
+    appendDraw(draws, move draw)
+    try drawPass(session, target, Surfaces.transparent, draws)
+    return .Ok(.Some(target))
+}
+
+function reducedBlur(
+    session: borrow mut RenderSession,
+    contents: borrow LayerContents,
+    inner: borrow [Clip],
+    blur: borrow Style
+) -> Result<GraphicsTexture, RenderFailure> {
+    var texture = try renderedSurface(session, contents, .None)
+    if inner.count > 0 {
+        texture = try clippedSurface(session, move texture, inner, 1)
+    }
+    let (blurred, opacity) = try styleFiltered(session, move texture, blur, 1)
+    return .Ok(blurred)
+}
+
+// GaussianBlur::layer_scale reads only the quality bits, and this port the
+// default quality alone: an opaque blur scales as a plain one does.
+function blurScaled(flags: BlurFlags) -> Bool {
+    return flags.raw == BlurFlags.none.raw || flags.raw == BlurFlags.opaque.raw
+}

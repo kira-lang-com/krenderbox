@@ -1,0 +1,241 @@
+// RenderBox's filter_color_fragment: a plane over the whole target reads the
+// layer's pixel and runs RB::Shader::filter_color on it, a colour matrix in
+// one of eight forms with alpha steps around it.
+//
+// RenderBox reads the pixel from the tile it is drawing into; here it is the
+// layer's surface, sampled at the same pixel's centre with a nearest sampler.
+// RB::Shader::Tables is a storage buffer: the sRGB encoding then the
+// decoding, 4096 entries each, read at a half's bits over eight.
+
+type FilterColorGlobals {
+    // ColorGlobals' 21 halves, four to a vector: m[0..20] in order.
+    let m0: Float4
+    let m1: Float4
+    let m2: Float4
+    let m3: Float4
+    let m4: Float4
+    let m5: Float4
+    // The form, state word 0 bits 21 to 23.
+    let mode: Float
+    // ColorFillState bits 0 to 3: state word 0 bits 16 to 19.
+    let unpremultiplyOuter: Float
+    let transfer: Float
+    let premultiplyInner: Float
+    let unpremultiplyInner: Float
+    // State word 2 bit 19: the target keeps alpha alone.
+    let alphaOnly: Float
+    // Device pixel to the layer's coordinates: one over the target's size.
+    let targetScale: Float2
+    // State word 2 bit 18: the pass is linear, so the transfer step encodes
+    // first and decodes after.
+    let linearPass: Float
+}
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+}
+
+type FragmentOut {
+    let color: Half4
+}
+
+// The 0xH1419 RenderBox divides alpha by only above.
+function unpremultiplied(color: Float4) -> Float4 {
+    if color.w > 0.0010004 {
+        return Float4(color.xyz / color.w, color.w)
+    }
+    return Float4(0.0, 0.0, 0.0, 0.0)
+}
+
+function premultiplied(color: Float4) -> Float4 {
+    return Float4(color.xyz * color.w, color.w)
+}
+
+// The entry of a table for |value|: its bits as a half over eight. A half
+// rounds to nearest, ties to even, as `round` does.
+function halfEntry(value: Float) -> Float {
+    let magnitude = abs(value)
+    if magnitude >= 65520.0 {
+        return 3968.0
+    }
+    if magnitude < 0.00006103515625 {
+        return floor(round(magnitude * 16777216.0) / 8.0)
+    }
+    let exponent = floor(log2(magnitude))
+    if exp2(exponent) > magnitude {
+        exponent = exponent - 1.0
+    }
+    if exp2(exponent + 1.0) <= magnitude {
+        exponent = exponent + 1.0
+    }
+    let mantissa = round((magnitude / exp2(exponent) - 1.0) * 1024.0)
+    return floor(((exponent + 15.0) * 1024.0 + mantissa) / 8.0)
+}
+
+// Forms 0 to 3: a scale, a scale by alpha, three columns, and three columns
+// with the bias times alpha.
+function lowForms(c: Float4, g: FilterColorGlobals) -> Float4 {
+    if g.mode == 0.0 {
+        return g.m0 * c
+    }
+    if g.mode == 1.0 {
+        return g.m0 * c.w
+    }
+    let rgb = c.x * g.m0.xyz + c.y * g.m1.xyz + c.z * g.m2.xyz
+    if g.mode == 2.0 {
+        return Float4(rgb, c.w)
+    }
+    return Float4(rgb + c.w * g.m4.xyz, c.w)
+}
+
+// Form 4: the whole matrix, four columns and the bias.
+function fullMatrix(c: Float4, g: FilterColorGlobals) -> Float4 {
+    return c.x * g.m0 + c.y * g.m1 + c.z * g.m2 + c.w * g.m3 + g.m4
+}
+
+// Form 5: a cubic of the Rec. 709 luminance, saturated, mixed in by m[7].
+function luminanceCurve(c: Float4, g: FilterColorGlobals) -> Float4 {
+    let luminance = clamp(dot(c.xyz, Float3(0.21252, 0.71533, 0.072083)), 0.0, 1.0)
+    let curve = clamp(((g.m0.x * luminance + g.m0.y) * luminance + g.m0.z) * luminance + g.m0.w, 0.0, 1.0)
+    return Float4(c.xyz * g.m1.w + g.m1.xyz * (c.w * curve), c.w)
+}
+
+// Form 6: a cubic per channel, alpha saturated.
+function channelCurve(c: Float4, g: FilterColorGlobals) -> Float4 {
+    let result = ((g.m0 * c + g.m1) * c + g.m2) * c + g.m3
+    return Float4(result.xyz, clamp(result.w, 0.0, 1.0))
+}
+
+// Form 7: a 3x3 matrix, a clamp to [-m[9..11], 1 - m[9..11]], then a second
+// 3x3 matrix. The halves run three to a column.
+function clampedMatrices(c: Float4, g: FilterColorGlobals) -> Float4 {
+    let into = c.x * g.m0.xyz + c.y * Float3(g.m0.w, g.m1.x, g.m1.y) + c.z * Float3(g.m1.z, g.m1.w, g.m2.x)
+    let offset = Float3(g.m2.y, g.m2.z, g.m2.w)
+    let clamped = clamp(into + offset, Float3(0.0, 0.0, 0.0), Float3(1.0, 1.0, 1.0)) - offset
+    let out = clamped.x * g.m3.xyz + clamped.y * Float3(g.m3.w, g.m4.x, g.m4.y) + clamped.z * Float3(g.m4.z, g.m4.w, g.m5.x)
+    return Float4(out, c.w)
+}
+
+function filtered(c: Float4, g: FilterColorGlobals) -> Float4 {
+    if g.mode < 4.0 {
+        return lowForms(c, g)
+    }
+    if g.mode == 4.0 {
+        return fullMatrix(c, g)
+    }
+    if g.mode == 5.0 {
+        return luminanceCurve(c, g)
+    }
+    if g.mode == 6.0 {
+        return channelCurve(c, g)
+    }
+    return clampedMatrices(c, g)
+}
+
+shader FilterColor {
+    group Filter {
+        uniform globals: FilterColorGlobals
+        texture layer: Texture2d
+        sampler layerSampler: Sampler
+        storage read transfer: [Float]
+    }
+
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        // Two triangles over the whole target: corners 0 1 2 and 0 2 3.
+        function entry(input: VertexIn) -> VertexOut {
+            let corner = input.vid
+            if input.vid == UInt(3) {
+                corner = UInt(0)
+            }
+            if input.vid > UInt(3) {
+                corner = input.vid - UInt(2)
+            }
+            let x = -1.0
+            if corner == UInt(1) || corner == UInt(2) {
+                x = 1.0
+            }
+            let y = 1.0
+            if corner > UInt(1) {
+                y = -1.0
+            }
+            let out: VertexOut
+            out.clip_position = Float4(x, y, 0.0, 1.0)
+            return out
+        }
+    }
+
+    fragment {
+        input VertexOut
+        output FragmentOut
+
+        // The colour's channels through table `table`, each keeping its sign.
+        function transferred(color: Float4, table: Float) -> Float4 {
+            let base = table * 4096.0
+            let r = sign(color.x) * transfer[UInt(base + halfEntry(color.x))]
+            let g = sign(color.y) * transfer[UInt(base + halfEntry(color.y))]
+            let b = sign(color.z) * transfer[UInt(base + halfEntry(color.z))]
+            return Float4(r, g, b, color.w)
+        }
+
+        // Before the matrix: unpremultiply and decode, then premultiply or
+        // unpremultiply again.
+        function before(color: Float4, globals: FilterColorGlobals) -> Float4 {
+            let result = color
+            if globals.unpremultiplyOuter == 1.0 {
+                result = unpremultiplied(result)
+            }
+            if globals.transfer == 1.0 {
+                result = transferred(result, 1.0 - globals.linearPass)
+            }
+            if globals.premultiplyInner == 1.0 {
+                return premultiplied(result)
+            }
+            if globals.unpremultiplyInner == 1.0 {
+                return unpremultiplied(result)
+            }
+            return result
+        }
+
+        // After the matrix, the steps undone in reverse.
+        function after(color: Float4, globals: FilterColorGlobals) -> Float4 {
+            let result = color
+            if globals.premultiplyInner == 1.0 {
+                result = unpremultiplied(result)
+            } else {
+                if globals.unpremultiplyInner == 1.0 {
+                    result = premultiplied(result)
+                }
+            }
+            if globals.transfer == 1.0 {
+                result = transferred(result, globals.linearPass)
+            }
+            if globals.unpremultiplyOuter == 1.0 {
+                return premultiplied(result)
+            }
+            return result
+        }
+
+        function entry(input: VertexOut) -> FragmentOut {
+            let texel = (floor(input.clip_position.xy) + 0.5) * globals.targetScale
+            let color = sample(layer, layerSampler, texel)
+            let result: FragmentOut
+            // An alpha-only target's one channel, which RenderBox splats, is
+            // alpha here.
+            if globals.alphaOnly == 1.0 {
+                result.color = Half4(filtered(Float4(color.w, color.w, color.w, color.w), globals))
+                return result
+            }
+            result.color = Half4(after(filtered(before(color, globals), globals), globals))
+            return result
+        }
+    }
+}

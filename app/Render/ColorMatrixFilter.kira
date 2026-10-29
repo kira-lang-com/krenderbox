@@ -1,0 +1,116 @@
+import Foundation
+import Ember
+
+// RB::Filter::ColorMatrix::set_globals' choice: the form filter_color runs,
+// ColorGlobals' halves and the fill state around it.
+struct FilterColorSetup {
+    var mode: Number = FilterColorForms.scale
+    var halves: [Number] = []
+    // ColorFillState bits 0 and 1, set together: the colour is
+    // unpremultiplied and decoded first, encoded and premultiplied after.
+    var linear: Bool = false
+    // Bit 0 alone, for a pass that is linear already.
+    var unpremultiplyOuter: Bool = false
+    // Bits 2 and 3: premultiplied or unpremultiplied around the matrix.
+    var premultiplyInner: Bool = false
+    var unpremultiplyInner: Bool = false
+}
+
+namespace FilterColorForms {
+    let scale: Number = 0
+    let alphaScale: Number = 1
+    let threeColumns: Number = 2
+    let threeColumnsBiased: Number = 3
+    let full: Number = 4
+    let clampedMatrices: Number = 7
+    // ColorGlobals' halves: five columns of four and one more.
+    let halfCount: Number = 21
+    let identity: [Number] = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0]
+    // The alpha row of each column: ColorMatrix::multiply_alpha's entries
+    // when the matrix takes unpremultiplied colours.
+    let alphaRow: [Number] = [3, 7, 11, 15, 19]
+}
+
+// `group Filter` in `Shaders/FilterColor.ksl`.
+namespace FilterColorDrawing {
+    let pipeline: String = "renderbox-filter-color"
+    let globalsFloatCount: UN32 = 36
+    let globalsBinding: UN32 = 0
+    let layerBinding: UN32 = 1
+    let layerSamplerBinding: UN32 = 2
+    let transferBinding: UN32 = 3
+    let vertexCount: UN32 = 6
+}
+
+// RB::ColorMatrix::set_color_matrix: column by column, each entry a half.
+function matrixColumns(matrix: borrow [Number]) -> [Number] {
+    var halves: [Number] = []
+    for column in 0..5 {
+        for row in 0..4 {
+            halves.append(halfRounded(matrix[row * 5 + column]))
+        }
+    }
+    return halves
+}
+
+// RB::ColorMatrix::multiply_alpha: every entry for a premultiplied matrix,
+// else the alpha row alone.
+function alphaMultiplied(
+    halves: borrow [Number],
+    opacity: Number,
+    premultiplied: Bool
+) -> [Number] {
+    var result = copy halves
+    if premultiplied {
+        let factor = halfRounded(opacity)
+        for index in 0..result.count {
+            result[index] = halfRounded(result[index] * factor)
+        }
+        return result
+    }
+    for index in FilterColorForms.alphaRow {
+        result[index] = halfRounded(opacity * result[index])
+    }
+    return result
+}
+
+function allZero(halves: borrow [Number], from: Number, count: Number) -> Bool {
+    for index in from..from + count {
+        if halves[index] != 0 {
+            return false
+        }
+    }
+    return true
+}
+
+// RB::ColorMatrix::is_diagonal: nothing off the diagonal and no bias.
+function isDiagonal(m: borrow [Number]) -> Bool {
+    let offDiagonal = [1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14]
+    for index in offDiagonal {
+        if m[index] != 0 {
+            return false
+        }
+    }
+    return allZero(m, 16, 4)
+}
+
+// RB::ColorMatrix::is_alpha_multiply: no colour column, and the output a
+// constant colour times alpha.
+function isAlphaMultiply(m: borrow [Number], premultiplied: Bool) -> Bool {
+    if !allZero(m, 0, 12) {
+        return false
+    }
+    if premultiplied {
+        return allZero(m, 16, 4)
+    }
+    return allZero(m, 12, 3) && m[19] == 0
+}
+
+// RB::ColorMatrix::has_alpha: the alpha column is not (0, 0, 0, 1), or a
+// colour column or the bias reaches alpha.
+function hasAlpha(m: borrow [Number]) -> Bool {
+    if !allZero(m, 12, 3) || m[15] != 1 {
+        return true
+    }
+    return m[3] != 0 || m[7] != 0 || m[11] != 0 || m[19] != 0
+}

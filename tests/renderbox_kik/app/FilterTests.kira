@@ -1,0 +1,126 @@
+import Foundation
+import RenderBox
+
+// Red halved and a quarter added, the other channels kept.
+function redFilter() -> [Number] {
+    return [0.5, 0, 0, 0, 0.25, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0]
+}
+
+function opaqueRed(list: borrow mut DisplayList) {
+    let side = Number(RenderTarget.side)
+    var shape = Shape()
+    shape.setRect(Rect { width: side, height: side })
+    var fill = Fill()
+    fill.setColor(RenderTarget.red, .StandardRgb)
+    list.drawShape(shape, fill, 1, .Normal)
+}
+
+function rendered(list: borrow mut DisplayList) -> Result<[UN8], RenderFailure> {
+    return renderLayer(
+        list.moveContents(),
+        RenderTarget.side,
+        RenderTarget.side,
+        RenderTarget.clear
+    )
+}
+
+// An empty layer needing the background, under a colour matrix and a clip
+// to the left half, filters what is under it there alone.
+@Test
+function backdropColorMatrixFiltersUnderTheClip() {
+    expect!(backdropColorMatrixFiltersUnderTheClipResult() == "191/255 255/255")
+}
+
+function backdropColorMatrixFiltersUnderTheClipResult() -> String {
+    var list = DisplayList()
+    opaqueRed(list)
+    list.save()
+    var left = Shape()
+    left.setRect(Rect { width: 4, height: Number(RenderTarget.side) })
+    list.clipShape(left, 1, .Normal)
+    list.addColorMatrixFilter(redFilter(), ColorFilterFlags.none)
+    list.beginLayer(LayerFlags.needsBackground)
+    match list.drawLayer(1, .Normal) {
+        Ok -> {}
+        Error(failure) -> return "failed \(failure)"
+    }
+    return sampled(rendered(list), [Point { x: 1, y: 4 }, Point { x: 6, y: 4 }])
+}
+
+// A diagonal matrix on a shape scales its colour.
+@Test
+function diagonalColorMatrixScalesAShape() {
+    expect!(diagonalColorMatrixScalesAShapeResult() == "128/255")
+}
+
+function diagonalColorMatrixScalesAShapeResult() -> String {
+    var list = DisplayList()
+    list.addColorMatrixFilter(
+        [0.5, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0],
+        ColorFilterFlags.none
+    )
+    opaqueRed(list)
+    return sampled(rendered(list), [Point { x: 4, y: 4 }])
+}
+
+// A clamp in sRGB keeps red at most half, measured encoded, and leaves the
+// zero channels.
+@Test
+function colorClampKeepsRedUnderTheMaximum() {
+    expect!(colorClampKeepsRedUnderTheMaximumResult() == "128/255")
+}
+
+function colorClampKeepsRedUnderTheMaximumResult() -> String {
+    var list = DisplayList()
+    list.addColorClampFilter(
+        RGBAColor { r: 0, g: 0, b: 0, a: 0 },
+        RGBAColor { r: 0.5, g: 1, b: 1, a: 1 },
+        .StandardRgb
+    )
+    opaqueRed(list)
+    return sampled(rendered(list), [Point { x: 4, y: 4 }])
+}
+
+// A gradient map from alpha turns an opaque shape into the last stop and
+// the clear pixels around it into the first. The white is dithered down a
+// step at this pixel, as RenderBox's noise does it.
+@Test
+function gradientMapReplacesByAlpha() {
+    expect!(gradientMapReplacesByAlphaResult() == "254/255 0/0")
+}
+
+function gradientMapReplacesByAlphaResult() -> String {
+    var list = DisplayList()
+    let stops = [
+        GradientStop { color: RGBAColor { r: 0, g: 0, b: 1, a: 0 }, location: 0 },
+        GradientStop { color: RGBAColor { r: 1, g: 1, b: 1, a: 1 }, location: 1 }
+    ]
+    list.addGradientMap(.Alpha, 0, 1, move stops, .StandardRgb, .Clamp, .Linear, .Device)
+    var shape = Shape()
+    shape.setRect(Rect { width: 4, height: Number(RenderTarget.side) })
+    var fill = Fill()
+    fill.setColor(RenderTarget.red, .StandardRgb)
+    list.drawShape(shape, fill, 1, .Normal)
+    return sampled(rendered(list), [Point { x: 1, y: 4 }, Point { x: 6, y: 4 }])
+}
+
+// A distance transform in the gradient format: red is the signed distance to
+// the edge of the rect from x = 2 to 6, nothing two pixels outside it and one
+// two inside. 1.5 is half a pixel outside and 4.5 is 1.5 inside, but the
+// distance table puts a full pixel's edge 0.4685 from its centre, not a half,
+// so each lands 0.03 nearer the edge: 0.383 and 0.867.
+@Test
+function distanceGradientMapsTheEdgeDistance() {
+    expect!(distanceGradientMapsTheEdgeDistanceResult() == "98/255 221/255")
+}
+
+function distanceGradientMapsTheEdgeDistanceResult() -> String {
+    var list = DisplayList()
+    list.addDistanceFilter(2, -2, 1, 0, .Gradient, .Default, .Exact)
+    var shape = Shape()
+    shape.setRect(Rect { x: 2, width: 4, height: Number(RenderTarget.side) })
+    var fill = Fill()
+    fill.setColor(RenderTarget.red, .StandardRgb)
+    list.drawShape(shape, fill, 1, .Normal)
+    return sampled(rendered(list), [Point { x: 1, y: 4 }, Point { x: 4, y: 4 }])
+}

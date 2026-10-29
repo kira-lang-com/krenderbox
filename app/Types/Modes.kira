@@ -1,0 +1,70 @@
+import Foundation
+
+// RBClipMode: whether a clip keeps what is inside its shape or what is outside.
+public enum ClipMode: UN32 {
+    Normal = 0
+    Inverse = 1
+}
+
+// How a layer's alpha combines with what is under it.
+public enum AlphaBlendMode: UN32 {
+    Normal = 0
+    Copy = 1
+    Additive = 2
+    Maximum = 3
+}
+
+// RBInterpolationMode: how an image is sampled when it is drawn scaled.
+public enum InterpolationMode: UN32 {
+    None = 0
+    Linear = 1
+    LinearMipmap = 2
+    Cubic = 3
+    CubicMipmap = 4
+    LowQuality = 5
+    MediumQuality = 6
+    HighQuality = 7
+    LinearLevel = 8
+    CubicLevel = 9
+    Quadratic = 10
+    QuadraticLevel = 11
+    QuadraticMipmap = 12
+}
+
+public enum LineCap: UN32 {
+    Round = 0
+    Square = 1
+    Butt = 2
+    OutwardsTriangle = 3
+    InwardsTriangle = 4
+    ForwardsTriangle = 5
+    BackwardsTriangle = 6
+}
+
+public enum LineJoin: UN32 {
+    Miter = 0
+    Round = 1
+    Bevel = 2
+}
+
+// RBColorSpace: the space a colour's components are in.
+public enum ColorSpace: UN32 {
+    Device = 0
+    StandardRgb = 1
+    LinearStandardRgb = 2
+    DisplayP3 = 3
+    LinearDisplayP3 = 4
+    Rec709 = 5
+    Rec2020 = 6
+    Rec2020StandardRgbGamma = 7
+    Rec2020Linear = 8
+    Rec2100PerceptualQuantizer = 9
+    Rec2100HybridLogGamma = 10
+    DisplayP3Rec709 = 11
+    AdobeRgb = 12
+    RommRgb = 13
+    DciP3 = 14
+    CoreMediaRec709 = 15
+    Gray = 16
+    LinearGray = 17
+}

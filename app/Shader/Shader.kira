@@ -1,0 +1,80 @@
+import Foundation
+
+// RBShaderLibrary: a compiled set of shader functions an app supplies. A
+// function in it is called per pixel with the point being shaded and its
+// arguments, as a RenderBox stitchable function is. RenderBox's come from a
+// Metal library; these are KSL shaders, one per function, written to the
+// contract `ShaderFill.kira` describes.
+public class ShaderLibrary {
+    let name: String
+    let functions: [ShaderFunction]
+}
+
+public struct ShaderFunction {
+    let name: String
+    let artifact: KslArtifact
+}
+
+extend ShaderLibrary {
+    function named(name: borrow String) -> ShaderFunction? {
+        for candidate in functions {
+            if candidate.name == name {
+                return .Some(copy candidate)
+            }
+        }
+        return .None
+    }
+}
+
+public struct Vector2 {
+    let x: Number
+    let y: Number
+}
+
+public struct Vector3 {
+    let x: Number
+    let y: Number
+    let z: Number
+}
+
+public struct Vector4 {
+    let x: Number
+    let y: Number
+    let z: Number
+    let w: Number
+}
+
+// RB::CustomShader::Value: one argument a shader function receives. RenderBox
+// codes its types 1 float, 2 float2, 3 float3, 4 float4, 5 colour, 6 image and
+// 7 mipmapped image; IconRendering hands its distance fields over as the last.
+public enum ShaderArgument {
+    Float(Number)
+    Float2(Vector2)
+    Float3(Vector3)
+    Float4(Vector4)
+    Color(RGBAColor)
+    Image(Image)
+    MipmappedImage(Image)
+}
+
+// RBShader: a function of a library and the arguments it is called with.
+public class Shader {
+    let library: ShaderLibrary
+    let functionName: String
+    // An index no argument was set at is unset, as RenderBox's ensure_arg
+    // leaves it.
+    var arguments: [ShaderArgument?] = []
+}
+
+extend Shader {
+    function setArgument(argument: ShaderArgument, index: UNumber) {
+        for _ in arguments.count..(index + 1) {
+            arguments.append(.None)
+        }
+        arguments[index] = .Some(argument)
+    }
+
+    function removeAllArguments() {
+        arguments = []
+    }
+}

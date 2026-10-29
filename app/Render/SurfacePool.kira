@@ -1,0 +1,157 @@
+import Foundation
+import Ember
+
+// RB::Device's texture cache: a surface a pass has finished with goes back to
+// the session, and the next request for one of the same size, format and use
+// takes it instead of allocating. Every surface lives until the render ends
+// otherwise, and a 5120-pixel icon makes hundreds of target-sized ones.
+//
+// Taking a surface back while the GPU may still read it is safe because the
+// session has one queue: each pass is submitted after the passes before it,
+// so a pass that draws into a reused surface runs after every read of it.
+
+// A surface the session made to draw into, and what it was made as.
+struct PooledSurface {
+    let width: UN32
+    let height: UN32
+    let format: TextureFormat
+    let usage: TextureUsage
+    let texture: GraphicsTexture
+}
+
+extend PooledSurface {
+    function fits(descriptor: borrow TextureDescriptor) -> Bool {
+        return width == descriptor.width && height == descriptor.height
+            && format == descriptor.format && usage == descriptor.usage
+    }
+
+    function holds(surface: borrow GraphicsTexture) -> Bool {
+        return texture.id == surface.id
+    }
+}
+
+// A surface made as `descriptor`, lent to the session's passes until they
+// give it back.
+function pooledSurface(
+    session: borrow mut RenderSession,
+    descriptor: TextureDescriptor
+) -> Result<GraphicsTexture, RenderFailure> {
+    let surface = try takenSurface(session, move descriptor)
+    let texture = copy surface.texture
+    session.lent.append(move surface)
+    return .Ok(texture)
+}
+
+// A surface made as `descriptor`, which the caller owns: one the session took
+// back when there is one, else a new one.
+function takenSurface(
+    session: borrow mut RenderSession,
+    descriptor: TextureDescriptor
+) -> Result<PooledSurface, RenderFailure> {
+    match idleIndex(session.idle, descriptor) {
+        Some(index) -> {
+            let surface = copy session.idle[index]
+            session.idle = without(session.idle, index)
+            return .Ok(surface)
+        }
+        None -> {}
+    }
+    let texture = match session.device.graphics().createTexture(descriptor) {
+        Ok(texture) -> texture
+        Error(failure) -> return .Error(.Resource(failure))
+    }
+    return .Ok(
+        PooledSurface {
+            width: descriptor.width,
+            height: descriptor.height,
+            format: descriptor.format,
+            usage: descriptor.usage,
+            texture: texture
+        }
+    )
+}
+
+function idleIndex(idle: borrow [PooledSurface], descriptor: borrow TextureDescriptor) -> Number? {
+    for (index, surface) in idle.enumerated() {
+        if surface.fits(descriptor) { return .Some(index) }
+    }
+    return .None
+}
+
+function without(surfaces: borrow [PooledSurface], index: Number) -> [PooledSurface] {
+    var kept: [PooledSurface] = []
+    for (at, surface) in surfaces.enumerated() {
+        if at != index { kept.append(copy surface) }
+    }
+    return kept
+}
+
+// How many surfaces are lent out: the mark `returnSurfaces` takes back to.
+function lentMark(session: borrow RenderSession) -> Number {
+    return session.lent.count
+}
+
+// Takes back every surface lent from `mark` up to `end` except `keeping`,
+// which passes not yet drawn still read or draw into. The ones lent after
+// `end` stay lent, in order.
+function returnSurfaces(
+    session: borrow mut RenderSession,
+    mark: Number,
+    end: Number,
+    keeping: borrow [GraphicsTexture]
+) {
+    var lent: [PooledSurface] = []
+    for (index, surface) in session.lent.enumerated() {
+        if index < mark || index >= end || kept(surface, keeping) {
+            lent.append(copy surface)
+        } else {
+            session.idle.append(copy surface)
+        }
+    }
+    session.lent = lent
+}
+
+// Takes back `texture` once every pass that reads it is submitted: a step of
+// a filter chain the next step has drawn from. A texture the session did
+// not lend stays as it is.
+function returnSurface(session: borrow mut RenderSession, texture: borrow GraphicsTexture) {
+    var lent: [PooledSurface] = []
+    for surface in session.lent {
+        if surface.holds(texture) {
+            session.idle.append(copy surface)
+        } else {
+            lent.append(copy surface)
+        }
+    }
+    session.lent = lent
+}
+
+// A chain's step taken back once the next step has read it, unless it is
+// the chain's `source`, which stays the caller's.
+function returnStep(
+    session: borrow mut RenderSession,
+    step: borrow GraphicsTexture,
+    source: borrow GraphicsTexture
+) {
+    if step.id != source.id { returnSurface(session, step) }
+}
+
+function kept(surface: borrow PooledSurface, keeping: borrow [GraphicsTexture]) -> Bool {
+    for texture in keeping {
+        if surface.holds(texture) { return true }
+    }
+    return false
+}
+
+// Every pooled surface the session holds, released.
+function releasePooledSurfaces(session: borrow mut RenderSession) {
+    let graphics = session.device.graphics()
+    for surface in session.lent {
+        graphics.destroyTexture(surface.texture)
+    }
+    for surface in session.idle {
+        graphics.destroyTexture(surface.texture)
+    }
+    session.lent = []
+    session.idle = []
+}
