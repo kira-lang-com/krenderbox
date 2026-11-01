@@ -1,5 +1,10 @@
 # 26.10.4
 
+**Project:** RenderBox  
+**Release week:** 2026-10-26 – 2026-11-01
+
+## Highlights
+
 The first source release of RenderBox includes:
 
 - A Kira display-list API with a state stack, layers, and drawing items.
